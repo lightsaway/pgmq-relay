@@ -1,0 +1,217 @@
+services:
+  # PostgreSQL with PGMQ extension
+  postgres:
+    image: ghcr.io/pgmq/pg18-pgmq:v1.9.0
+    container_name: pgmq-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pgmq_relay
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/01-init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgmq_relay"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pgmq-network
+
+  # Redpanda (Kafka alternative)
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.3
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+    ports:
+      - "18081:18081" # Schema Registry
+      - "18082:18082" # REST Proxy
+      - "19092:19092" # Kafka API
+      - "19644:9644" # Admin API
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - pgmq-network
+
+  # Redpanda Console for UI
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.4.3
+    container_name: redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+        connect:
+          enabled: false
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - pgmq-network
+
+  # RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    ports:
+      - "5672:5672" # AMQP port
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pgmq-network
+
+  # NATS
+  nats:
+    image: nats:2.10-alpine
+    container_name: nats
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    ports:
+      - "4222:4222" # Client connections
+      - "8222:8222" # HTTP monitoring
+      - "6222:6222" # Routing port for clustering
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:8222/healthz || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pgmq-network
+
+  # NATS UI
+  nats-ui:
+    image: ghcr.io/nats-nui/nui:latest
+    container_name: nats-ui
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_MONITOR_URL: http://nats:8222
+    ports:
+      - "31311:31311" # NATS UI
+    networks:
+      - pgmq-network
+
+  # PGMQ Relay Application
+  pgmq-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pgmq-relay
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      RUST_BACKTRACE: 1
+      LOG_FORMAT: text # Set to "json" for JSON logs, "text" for human-readable (requires image rebuild)
+      # Note: sqlx slow query warnings (>1s) are expected and cannot be disabled
+      # They confirm that read_with_poll modes are working (waiting up to max_poll_seconds)
+    ports:
+      - "9090:9090" # Metrics endpoint
+    volumes:
+      # Mount local config file to override the one in the container
+      - ./docker/config-docker.toml:/etc/pgmq-relay/config.toml:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        ["CMD-SHELL", "wget -q --spider http://localhost:9090/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - pgmq-network
+
+  # Test Message Sender - continuously sends test messages to PGMQ queues
+  test-message-sender:
+    image: ghcr.io/pgmq/pg18-pgmq:v1.9.0
+    container_name: test-message-sender
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MESSAGE_INTERVAL: "2" # Seconds between messages
+    volumes:
+      - ./scripts/send_test_messages.sh:/send_test_messages.sh:ro
+    command: >
+      bash -c "
+        echo 'Waiting for PGMQ to be ready...';
+        sleep 5;
+        echo 'Starting test message sender...';
+        bash /send_test_messages.sh --host postgres --interval $$MESSAGE_INTERVAL
+      "
+    restart: unless-stopped
+    networks:
+      - pgmq-network
+    profiles:
+      - testing
+
+volumes:
+  postgres_data:
+    driver: local
+  redpanda_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  nats_data:
+    driver: local
+
+networks:
+  pgmq-network:
+    driver: bridge

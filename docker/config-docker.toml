@@ -1,0 +1,97 @@
+# PGMQ Relay Configuration for Docker Environment - Multi-Broker
+
+# Default broker for queues that don't specify their own
+default_broker = "redpanda"
+
+[pgmq]
+connection_url = "postgres://postgres:postgres@postgres:5432/pgmq_relay"
+max_connections = 10
+
+[relay]
+poll_interval = "1s"
+poll_timeout = "5s"
+batch_size = 10
+visibility_timeout_seconds = 30
+
+[metrics]
+enabled = true
+bind_address = "0.0.0.0"
+port = 9090
+
+[brokers.redpanda]
+type = "kafka"
+bootstrap_servers = "redpanda:9092"
+
+[brokers.redpanda.transactions]
+strategy = { type = "hostname" }
+timeout_ms = 60000
+retries = 3
+
+[brokers.rabbitmq]
+type = "rabbitmq"
+url = "amqp://admin:admin@rabbitmq:5672"
+exchange = "pgmq.relay"
+exchange_type = "topic"
+
+[brokers.nats]
+type = "nats"
+url = "nats://nats:4222"
+
+[[queues]]
+queue_name = "user_events"
+destination_topic = "events.users"
+key_field = "user_id"
+archive_messages = false
+parallelism = 3
+poll_interval = "250ms"
+batch_size = 100
+visibility_timeout_seconds = 30
+# Using default fetch_mode = "regular"
+
+[[queues]]
+queue_name = "notifications"
+destination_topic = "notifications.email"
+broker_name = "rabbitmq"
+key_field = "notification_id"
+archive_messages = false
+parallelism = 2
+poll_interval = "500ms"
+batch_size = 50
+visibility_timeout_seconds = 30
+# Long-polling mode: reduces polling overhead by waiting for messages
+fetch_mode = "read_with_poll"
+max_poll_seconds = 5
+poll_interval_ms = 100
+
+[[queues]]
+queue_name = "logs"
+destination_topic = "logs.system"
+broker_name = "nats"
+key_field = "log_id"
+archive_messages = true
+parallelism = 1
+poll_interval = "500ms"
+batch_size = 50
+visibility_timeout_seconds = 20
+# FIFO grouped mode: messages with same group ID processed in order
+fetch_mode = "read_grouped"
+
+# Example of round-robin FIFO grouped reading with polling
+# [[queues]]
+# queue_name = "ordered_tasks"
+# destination_topic = "tasks.ordered"
+# key_field = "task_id"
+# fetch_mode = "read_grouped_rr_with_poll"
+# max_poll_seconds = 3
+# poll_interval_ms = 50
+# batch_size = 20
+# visibility_timeout_seconds = 60
+
+# Example of pop mode (at-most-once delivery - use with caution!)
+# [[queues]]
+# queue_name = "fire_and_forget"
+# destination_topic = "events.fire_and_forget"
+# key_field = "event_id"
+# fetch_mode = "pop"
+# batch_size = 10
+# # Note: archive_messages has no effect with pop mode

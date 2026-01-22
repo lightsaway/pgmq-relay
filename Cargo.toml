@@ -1,0 +1,71 @@
+[package]
+name = "pgmq-relay"
+version = "0.1.0"
+edition = "2021"
+authors = ["PGMQ Relay Maintainers"]
+description = "A message relay service that forwards PGMQ messages to various message brokers"
+keywords = ["messaging", "queues", "postgres", "relay", "kafka"]
+license = "PostgreSQL"
+repository = "https://github.com/pgmq/pgmq"
+
+[lib]
+name = "pgmq_relay"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enable verbose debug logging (normally disabled for performance)
+verbose-logging = []
+# Enable per-message trace logging (very expensive, debug only)
+trace-messages = []
+# Enable hot-path trace logging (extremely expensive, debug only)
+trace-hot-paths = []
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+
+# Configuration and serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+humantime-serde = "1.1"
+
+# Message broker integrations
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored"] }
+lapin = "2.3"
+async-nats = "0.33"
+
+# Error handling and logging
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "chrono", "uuid"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+# Circuit breaker and error recovery
+failsafe = "1.0"
+backoff = "0.4"
+
+# Metrics and monitoring
+prometheus = "0.13"
+axum = "0.7"
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors"] }
+hyper = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+test-log = "0.2"

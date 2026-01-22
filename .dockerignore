@@ -1,0 +1,13 @@
+target/
+.git/
+.gitignore
+*.md
+!docker/*.md
+Makefile
+.env*
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
