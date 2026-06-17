@@ -64,8 +64,6 @@ pub enum ConfigValidationError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub pgmq: PgmqConfig,
-    #[serde(default)]
-    pub relay: RelayConfig,
     pub brokers: HashMap<String, BrokerConfig>,
     /// Default broker name for queues that don't specify their own broker
     #[serde(default)]
@@ -114,23 +112,6 @@ where
         ));
     }
     Ok(max_connections)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RelayConfig {
-    #[serde(default = "default_poll_interval")]
-    #[serde(with = "humantime_serde")]
-    pub poll_interval: Duration,
-
-    #[serde(default = "default_poll_timeout")]
-    #[serde(with = "humantime_serde")]
-    pub poll_timeout: Duration,
-
-    #[serde(default = "default_batch_size")]
-    pub batch_size: i32,
-
-    #[serde(default = "default_visibility_timeout")]
-    pub visibility_timeout_seconds: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +257,14 @@ pub struct QueueConfig {
     /// When false (default), messages are permanently deleted
     #[serde(default)]
     pub archive_messages: bool,
+
+    /// Optional PGMQ queue to route messages that fail transformation (poison messages).
+    /// When set, a message that cannot be transformed is re-enqueued onto this queue and
+    /// removed from the source queue, preventing head-of-line blocking. When unset, a
+    /// failing message is left in the source queue (it becomes visible again after the
+    /// visibility timeout) and is retried without blocking the rest of the batch.
+    #[serde(default)]
+    pub dead_letter_queue: Option<String>,
 
     /// Number of parallel workers to spawn for this queue (default: 1)
     /// Can be overridden with PGMQ_RELAY_DEFAULT_PARALLELISM env var
@@ -424,13 +413,6 @@ fn default_poll_interval() -> Duration {
         .unwrap_or_else(|| Duration::from_millis(250))
 }
 
-fn default_poll_timeout() -> Duration {
-    std::env::var("PGMQ_RELAY_DEFAULT_POLL_TIMEOUT")
-        .ok()
-        .and_then(|v| humantime::parse_duration(&v).ok())
-        .unwrap_or_else(|| Duration::from_secs(5))
-}
-
 fn default_batch_size() -> i32 {
     std::env::var("PGMQ_RELAY_DEFAULT_BATCH_SIZE")
         .ok()
@@ -496,38 +478,30 @@ impl Config {
 
     /// Comprehensive configuration validation with detailed error reporting
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
-        // Validate PGMQ configuration
         self.validate_pgmq_config()?;
 
-        // Validate brokers configuration
         self.validate_brokers_config()?;
 
-        // Validate queues configuration
         self.validate_queues_config()?;
 
-        // Validate metrics configuration
         self.validate_metrics_config()?;
 
-        // Cross-validation checks
         self.validate_cross_references()?;
 
         Ok(())
     }
 
     fn validate_pgmq_config(&self) -> Result<(), ConfigValidationError> {
-        // Check connection URL
         if self.pgmq.connection_url.trim().is_empty() {
             return Err(ConfigValidationError::InvalidConnectionUrl);
         }
 
-        // Basic URL format validation
         if !self.pgmq.connection_url.starts_with("postgres://")
             && !self.pgmq.connection_url.starts_with("postgresql://")
         {
             return Err(ConfigValidationError::InvalidConnectionUrl);
         }
 
-        // Validate max_connections
         if self.pgmq.max_connections == 0 || self.pgmq.max_connections > 100 {
             return Err(ConfigValidationError::InvalidMaxConnections {
                 max_connections: self.pgmq.max_connections,
@@ -538,12 +512,10 @@ impl Config {
     }
 
     fn validate_brokers_config(&self) -> Result<(), ConfigValidationError> {
-        // Check that we have at least one broker
         if self.brokers.is_empty() {
             return Err(ConfigValidationError::NoBrokers);
         }
 
-        // Validate each broker configuration
         for (broker_name, broker_config) in &self.brokers {
             self.validate_broker_config(broker_name, broker_config)?;
         }
@@ -556,7 +528,6 @@ impl Config {
         broker_name: &str,
         broker_config: &BrokerConfig,
     ) -> Result<(), ConfigValidationError> {
-        // Use the Validator trait implementation from each broker config
         let validation_result = match broker_config {
             BrokerConfig::Kafka(kafka_config) => kafka_config.validate(),
             BrokerConfig::RabbitMQ(rabbitmq_config) => rabbitmq_config.validate(),
@@ -570,12 +541,10 @@ impl Config {
     }
 
     fn validate_queues_config(&self) -> Result<(), ConfigValidationError> {
-        // Check that we have at least one queue
         if self.queues.is_empty() {
             return Err(ConfigValidationError::NoQueues);
         }
 
-        // Check for duplicate queue names
         let mut queue_names = std::collections::HashSet::new();
         for queue in &self.queues {
             if !queue_names.insert(&queue.queue_name) {
@@ -585,7 +554,6 @@ impl Config {
             }
         }
 
-        // Validate each queue
         for queue in &self.queues {
             self.validate_queue_config(queue)?;
         }
@@ -594,14 +562,12 @@ impl Config {
     }
 
     fn validate_queue_config(&self, queue: &QueueConfig) -> Result<(), ConfigValidationError> {
-        // Validate queue name
         if queue.queue_name.trim().is_empty() {
             return Err(ConfigValidationError::InvalidQueueName {
                 queue_name: queue.queue_name.clone(),
             });
         }
 
-        // Queue name should contain only alphanumeric characters, underscores, and hyphens
         if !queue
             .queue_name
             .chars()
@@ -612,7 +578,6 @@ impl Config {
             });
         }
 
-        // Validate parallelism
         if queue.parallelism == 0 {
             return Err(ConfigValidationError::InvalidParallelism {
                 queue_name: queue.queue_name.clone(),
@@ -620,7 +585,6 @@ impl Config {
             });
         }
 
-        // Validate batch size
         if queue.batch_size <= 0 || queue.batch_size > 1000 {
             return Err(ConfigValidationError::InvalidBatchSize {
                 queue_name: queue.queue_name.clone(),
@@ -628,7 +592,6 @@ impl Config {
             });
         }
 
-        // Validate visibility timeout
         if queue.visibility_timeout_seconds <= 0 || queue.visibility_timeout_seconds > 3600 {
             return Err(ConfigValidationError::InvalidVisibilityTimeout {
                 queue_name: queue.queue_name.clone(),
@@ -636,7 +599,6 @@ impl Config {
             });
         }
 
-        // Validate poll interval
         let min_interval = Duration::from_millis(10);
         let max_interval = Duration::from_secs(30);
         if queue.poll_interval < min_interval || queue.poll_interval > max_interval {
@@ -646,7 +608,6 @@ impl Config {
             });
         }
 
-        // Validate key field
         if queue.key_field.trim().is_empty() {
             return Err(ConfigValidationError::InvalidBrokerConfig {
                 broker_name: "queue_config".to_string(),
@@ -654,12 +615,10 @@ impl Config {
             });
         }
 
-        // Validate polling parameters for polling-based fetch modes
         match queue.fetch_mode {
             FetchMode::ReadWithPoll
             | FetchMode::ReadGroupedWithPoll
             | FetchMode::ReadGroupedRoundRobinWithPoll => {
-                // Validate max_poll_seconds (1-60 seconds recommended)
                 if queue.max_poll_seconds <= 0 || queue.max_poll_seconds > 60 {
                     return Err(ConfigValidationError::InvalidBrokerConfig {
                         broker_name: "queue_config".to_string(),
@@ -670,7 +629,6 @@ impl Config {
                     });
                 }
 
-                // Validate poll_interval_ms (10-1000ms recommended)
                 if queue.poll_interval_ms <= 0 || queue.poll_interval_ms > 1000 {
                     return Err(ConfigValidationError::InvalidBrokerConfig {
                         broker_name: "queue_config".to_string(),
@@ -682,6 +640,28 @@ impl Config {
                 }
             }
             _ => {}
+        }
+
+        // Warn if grouped/FIFO ordering is combined with parallelism > 1. Per-group order is
+        // only preserved because PGMQ's visibility timeout keeps a group invisible to other
+        // readers while one worker holds it; combined with at-least-once redelivery, strict
+        // global ordering across workers is not guaranteed.
+        let is_grouped = matches!(
+            queue.fetch_mode,
+            FetchMode::ReadGrouped
+                | FetchMode::ReadGroupedWithPoll
+                | FetchMode::ReadGroupedRoundRobin
+                | FetchMode::ReadGroupedRoundRobinWithPoll
+        );
+        if is_grouped && queue.parallelism > 1 {
+            tracing::warn!(
+                "Queue '{}' uses a grouped/FIFO fetch mode with parallelism={}. \
+                 Per-group FIFO ordering is preserved per worker, but strict ordering can \
+                 still be affected by at-least-once redelivery. Use parallelism=1 if you \
+                 require strict ordering.",
+                queue.queue_name,
+                queue.parallelism
+            );
         }
 
         // Warn if archive_messages is set with Pop mode (messages are already deleted)
@@ -697,7 +677,6 @@ impl Config {
     }
 
     fn validate_metrics_config(&self) -> Result<(), ConfigValidationError> {
-        // Validate metrics port
         if self.metrics.port == 0 || self.metrics.port < 1024 {
             return Err(ConfigValidationError::InvalidMetricsConfig {
                 reason: format!(
@@ -707,7 +686,6 @@ impl Config {
             });
         }
 
-        // Validate bind address
         if self.metrics.bind_address.trim().is_empty() {
             return Err(ConfigValidationError::InvalidMetricsConfig {
                 reason: "Metrics bind_address cannot be empty".to_string(),
@@ -718,7 +696,6 @@ impl Config {
     }
 
     fn validate_cross_references(&self) -> Result<(), ConfigValidationError> {
-        // Validate that all queues reference existing brokers
         for queue in &self.queues {
             if let Some(broker_name) = queue.effective_broker_name(self) {
                 if !self.brokers.contains_key(broker_name) {
@@ -798,7 +775,6 @@ mod tests {
                 connection_url: "postgres://user:pass@localhost:5432/db".to_string(),
                 max_connections: 10,
             },
-            relay: RelayConfig::default(),
             brokers,
             default_broker: Some("test_kafka".to_string()),
             broker_name: None,
@@ -811,6 +787,7 @@ mod tests {
                 poll_interval_ms: 100,
                 key_field: "message_id".to_string(),
                 archive_messages: false,
+                dead_letter_queue: None,
                 parallelism: 1,
                 poll_interval: Duration::from_millis(250),
                 batch_size: 10,
@@ -819,6 +796,15 @@ mod tests {
             }],
             metrics: MetricsConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_grouped_mode_with_parallelism_warns_but_is_valid() {
+        let mut config = create_minimal_valid_config();
+        config.queues[0].fetch_mode = FetchMode::ReadGrouped;
+        config.queues[0].parallelism = 4;
+        // Validation should still pass (warning only, not a hard error).
+        assert!(config.validate().is_ok());
     }
 
     #[test]

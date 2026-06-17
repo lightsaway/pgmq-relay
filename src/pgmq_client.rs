@@ -48,6 +48,18 @@ pub trait PgmqClient: Send + Sync {
         queue_config: &QueueConfig,
     ) -> Result<(), RelayError>;
 
+    /// Re-enqueue a single message onto a dead-letter queue, preserving the original
+    /// payload and headers and attaching dead-letter metadata (source queue, original
+    /// msg_id, failure reason). Does NOT remove the message from the source queue; the
+    /// caller is responsible for completing/deleting the original after this succeeds.
+    async fn send_to_dead_letter(
+        &self,
+        dead_letter_queue: &str,
+        source_queue: &str,
+        message: &PgmqMessageWithHeaders,
+        error: &str,
+    ) -> Result<(), RelayError>;
+
     fn is_ready_to_process(&self) -> bool;
 }
 
@@ -63,7 +75,6 @@ impl PgmqClientImpl {
             config.connection_url, config.max_connections
         );
 
-        // Create connection pool
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(1)
@@ -79,7 +90,6 @@ impl PgmqClientImpl {
             config.max_connections
         );
 
-        // Create circuit breaker for message deletion operations using default config
         let circuit_breaker_config = CircuitBreakerConfig::default();
         let metrics = GlobalCircuitBreakerMetrics::new("pgmq_deletion");
         let deletion_circuit_breaker =
@@ -132,14 +142,12 @@ impl PgmqClientImpl {
                 )
             }
             FetchMode::ReadGroupedRoundRobinWithPoll => {
-                // SELECT * FROM pgmq.read_grouped_rr_with_poll(queue_name, vt, qty, max_poll_seconds, poll_interval_ms)
                 format!(
                     "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
                      FROM pgmq.read_grouped_rr_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
                 )
             }
             FetchMode::Pop => {
-                // SELECT * FROM pgmq.pop(queue_name, qty)
                 // Note: pop() doesn't use visibility timeout
                 format!(
                     "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
@@ -148,10 +156,8 @@ impl PgmqClientImpl {
             }
         };
 
-        // Build query based on fetch mode
         let mut query_builder = sqlx::query(&query).bind(queue_name);
 
-        // Bind parameters based on fetch mode
         match queue_config.fetch_mode {
             FetchMode::Regular | FetchMode::ReadGrouped | FetchMode::ReadGroupedRoundRobin => {
                 // These modes use: queue_name, vt, qty
@@ -232,7 +238,6 @@ impl PgmqClient for PgmqClientImpl {
             queue_name
         );
 
-        // Execute deletion with circuit breaker protection
         let pool = self.pool.clone();
         let queue_name_owned = queue_name.clone();
         let msg_ids_owned = msg_ids.clone();
@@ -244,20 +249,22 @@ impl PgmqClient for PgmqClientImpl {
                 let queue_name_owned = queue_name_owned.clone();
                 let msg_ids_owned = msg_ids_owned.clone();
                 async move {
-                    // Use SQL: SELECT pgmq.delete(queue_name, msg_id)
-                    for msg_id in &msg_ids_owned {
-                        sqlx::query("SELECT pgmq.delete($1::text, $2::bigint)")
-                            .bind(&queue_name_owned)
-                            .bind(msg_id)
-                            .execute(&*pool)
-                            .await
-                            .map_err(|e| {
-                                RelayError::PgmqOperation(format!(
-                                    "Failed to delete message {}: {}",
-                                    msg_id, e
-                                ))
-                            })?;
-                    }
+                    // Delete the whole batch in a single statement using the array form
+                    // pgmq.delete(queue_name text, msg_ids bigint[]). This is one round-trip
+                    // and a single atomic statement, so the batch can no longer be left
+                    // partially completed by a mid-loop failure.
+                    sqlx::query("SELECT pgmq.delete($1::text, $2::bigint[])")
+                        .bind(&queue_name_owned)
+                        .bind(&msg_ids_owned)
+                        .execute(&*pool)
+                        .await
+                        .map_err(|e| {
+                            RelayError::PgmqOperation(format!(
+                                "Failed to delete {} messages: {}",
+                                msg_ids_owned.len(),
+                                e
+                            ))
+                        })?;
                     Ok(())
                 }
             })
@@ -295,20 +302,20 @@ impl PgmqClient for PgmqClientImpl {
             queue_messages.queue_name
         );
 
-        // Use SQL: SELECT pgmq.archive(queue_name, msg_id)
-        for msg_id in &msg_ids {
-            sqlx::query("SELECT pgmq.archive($1::text, $2::bigint)")
-                .bind(&queue_messages.queue_name)
-                .bind(msg_id)
-                .execute(&*self.pool)
-                .await
-                .map_err(|e| {
-                    RelayError::PgmqOperation(format!(
-                        "Failed to archive message {}: {}",
-                        msg_id, e
-                    ))
-                })?;
-        }
+        // Archive the whole batch in a single statement using the array form
+        // pgmq.archive(queue_name text, msg_ids bigint[]) - one round-trip, atomic.
+        sqlx::query("SELECT pgmq.archive($1::text, $2::bigint[])")
+            .bind(&queue_messages.queue_name)
+            .bind(&msg_ids)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| {
+                RelayError::PgmqOperation(format!(
+                    "Failed to archive {} messages: {}",
+                    msg_ids.len(),
+                    e
+                ))
+            })?;
 
         info!(
             "Archived {} messages from queue '{}' to archive table",
@@ -350,6 +357,54 @@ impl PgmqClient for PgmqClientImpl {
             );
             self.delete_messages(queue_messages).await
         }
+    }
+
+    async fn send_to_dead_letter(
+        &self,
+        dead_letter_queue: &str,
+        source_queue: &str,
+        message: &PgmqMessageWithHeaders,
+        error: &str,
+    ) -> Result<(), RelayError> {
+        // Build dead-letter headers: preserve original headers under a nested key and
+        // attach metadata describing why the message was dead-lettered.
+        let mut dlq_headers = serde_json::Map::new();
+        dlq_headers.insert(
+            "x-dead-letter-source-queue".to_string(),
+            Value::String(source_queue.to_string()),
+        );
+        dlq_headers.insert(
+            "x-dead-letter-msg-id".to_string(),
+            Value::String(message.msg_id.to_string()),
+        );
+        dlq_headers.insert(
+            "x-dead-letter-error".to_string(),
+            Value::String(error.to_string()),
+        );
+        if let Some(original) = &message.headers {
+            dlq_headers.insert("x-dead-letter-original-headers".to_string(), original.clone());
+        }
+        let headers_value = Value::Object(dlq_headers);
+
+        sqlx::query("SELECT pgmq.send($1::text, $2::jsonb, $3::jsonb)")
+            .bind(dead_letter_queue)
+            .bind(&message.message)
+            .bind(&headers_value)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| {
+                RelayError::PgmqOperation(format!(
+                    "Failed to send message {} to dead-letter queue '{}': {}",
+                    message.msg_id, dead_letter_queue, e
+                ))
+            })?;
+
+        info!(
+            "Routed message {} from queue '{}' to dead-letter queue '{}'",
+            message.msg_id, source_queue, dead_letter_queue
+        );
+
+        Ok(())
     }
 
     fn is_ready_to_process(&self) -> bool {

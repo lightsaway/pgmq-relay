@@ -12,13 +12,19 @@ use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
+use crate::health::HealthState;
 use crate::metrics_service;
 
 #[derive(Clone)]
-pub struct MetricsState;
+pub struct MetricsState {
+    health: HealthState,
+}
 
-pub async fn start_metrics_server(bind_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let app = create_metrics_app();
+pub async fn start_metrics_server(
+    bind_addr: SocketAddr,
+    health: HealthState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = create_metrics_app(health);
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Metrics server listening on http://{}", bind_addr);
@@ -27,7 +33,7 @@ pub async fn start_metrics_server(bind_addr: SocketAddr) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn create_metrics_app() -> Router {
+fn create_metrics_app(health: HealthState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -36,7 +42,7 @@ fn create_metrics_app() -> Router {
             ServiceBuilder::new()
                 .layer(CorsLayer::permissive())
         )
-        .with_state(MetricsState)
+        .with_state(MetricsState { health })
 }
 
 async fn metrics_handler(State(_state): State<MetricsState>) -> Response {
@@ -75,12 +81,20 @@ async fn metrics_handler(State(_state): State<MetricsState>) -> Response {
     }
 }
 
-async fn health_handler(State(_state): State<MetricsState>) -> Response {
-    (StatusCode::OK, "OK").into_response()
+async fn health_handler(State(state): State<MetricsState>) -> Response {
+    if state.health.is_live() {
+        (StatusCode::OK, "OK").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "Unhealthy").into_response()
+    }
 }
 
-async fn ready_handler(State(_state): State<MetricsState>) -> Response {
-    (StatusCode::OK, "Ready").into_response()
+async fn ready_handler(State(state): State<MetricsState>) -> Response {
+    if state.health.is_ready() {
+        (StatusCode::OK, "Ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "Not Ready").into_response()
+    }
 }
 
 #[cfg(test)]
@@ -92,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint() {
-        let app = create_metrics_app();
+        let app = create_metrics_app(crate::health::HealthState::new());
 
         let response = app
             .oneshot(
@@ -108,8 +122,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ready_endpoint() {
-        let app = create_metrics_app();
+    async fn test_ready_endpoint_not_ready_by_default() {
+        // A freshly created HealthState is not ready until workers start and PGMQ is ready.
+        let app = create_metrics_app(crate::health::HealthState::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_when_ready() {
+        let health = crate::health::HealthState::new();
+        health.set_started(true);
+        health.set_pgmq_ready(true);
+        let app = create_metrics_app(health);
 
         let response = app
             .oneshot(
@@ -127,7 +162,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_endpoint() {
         crate::metrics_service::init_metrics().unwrap();
-        let app = create_metrics_app();
+        let app = create_metrics_app(crate::health::HealthState::new());
 
         let response = app
             .oneshot(

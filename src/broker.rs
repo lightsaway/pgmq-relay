@@ -33,11 +33,12 @@ pub trait MessageBroker: Send + Sync {
 pub async fn create_broker(
     name: &str,
     config: &BrokerConfig,
+    instance_id: &str,
 ) -> Result<Box<dyn MessageBroker>, RelayError> {
     match config {
         BrokerConfig::Kafka(kafka_config) => {
             info!("Creating Kafka broker connection: {}", name);
-            let broker = crate::brokers::kafka::KafkaBroker::new(name, kafka_config)?;
+            let broker = crate::brokers::kafka::KafkaBroker::new(name, kafka_config, instance_id)?;
             Ok(Box::new(broker))
         }
         BrokerConfig::Nats(nats_config) => {

@@ -9,6 +9,7 @@ mod brokers;
 mod circuit_breaker;
 mod config;
 mod error;
+mod health;
 mod logging;
 mod metrics_server;
 mod metrics_service;
@@ -18,6 +19,7 @@ mod transformer;
 mod validator;
 
 use config::Config;
+use health::HealthState;
 use metrics_service::{MetricsService, PrometheusMetricsService, SystemMetric};
 use relay::Relay;
 
@@ -37,7 +39,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging based on environment
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "pgmq_relay=info".into());
@@ -63,7 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_file(&cli.config)?;
 
-    // If validate_config flag is set, validate and exit
     if cli.validate_config {
         info!("✅ Configuration validation successful!");
         info!("📄 Config file: {}", cli.config);
@@ -71,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("🔗 Brokers configured: {}", config.brokers.len());
         info!("📊 Metrics enabled: {}", config.metrics.enabled);
 
-        // Additional validation with suggestions
         match config.validate_with_suggestions() {
             Ok(()) => {
                 info!("🎉 All configuration checks passed!");
@@ -89,19 +88,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_service: Arc<dyn MetricsService> = Arc::new(PrometheusMetricsService::new()?);
     info!("Metrics initialized");
 
-    // Record startup
     metrics_service.record_system_metric(SystemMetric::Restart);
 
-    let mut relay = Relay::new(config.clone(), Arc::clone(&metrics_service)).await?;
+    // Shared health state backing the /health and /ready probes.
+    let health = HealthState::new();
+
+    let mut relay = Relay::new(config.clone(), Arc::clone(&metrics_service), health.clone()).await?;
 
     if config.metrics.enabled {
         let metrics_addr = format!("{}:{}", config.metrics.bind_address, config.metrics.port)
             .parse()
             .map_err(|e| format!("Invalid metrics bind address: {}", e))?;
 
+        let metrics_health = health.clone();
         tokio::spawn(async move {
             info!("Starting metrics server on {}", metrics_addr);
-            if let Err(e) = metrics_server::start_metrics_server(metrics_addr).await {
+            if let Err(e) = metrics_server::start_metrics_server(metrics_addr, metrics_health).await {
                 error!("Metrics server failed: {}", e);
             }
         });
@@ -109,17 +111,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     relay.start().await?;
 
-    // Start background task for system metrics
     let metrics_service_bg = Arc::clone(&metrics_service);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut last_tick = tokio::time::Instant::now();
         loop {
             interval.tick().await;
 
-            // Record uptime tick (every 10 seconds)
-            metrics_service_bg.record_system_metric(SystemMetric::UptimeTick);
+            // Record the real elapsed time so the uptime counter reports true seconds
+            // (not one increment per tick) and stays correct if the interval changes.
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(last_tick).as_secs_f64();
+            last_tick = now;
+            metrics_service_bg.record_system_metric(SystemMetric::UptimeSeconds(elapsed));
 
-            // Update memory usage if possible
             #[cfg(target_os = "linux")]
             if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
                 for line in status.lines() {
@@ -128,7 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(kb) = kb_str.parse::<f64>() {
                                 metrics_service_bg
                                     .record_system_metric(SystemMetric::MemoryUsage(kb * 1024.0));
-                                // Convert KB to bytes
                             }
                         }
                         break;
@@ -136,13 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // For non-Linux systems, we can't easily get memory usage
-            // so we'll set a placeholder value or use system-specific methods
+            // On non-Linux systems we don't have a cheap RSS source, so we simply do not
+            // emit the memory gauge rather than reporting a misleading 0 bytes.
             #[cfg(not(target_os = "linux"))]
             {
-                // Use 0 as placeholder - in production you might want to use
-                // platform-specific memory APIs
-                metrics_service_bg.record_system_metric(SystemMetric::MemoryUsage(0.0));
+                let _ = &metrics_service_bg;
             }
         }
     });

@@ -47,7 +47,6 @@ pub struct KafkaConfig {
     pub additional_config: HashMap<String, String>,
 }
 
-// Default functions with environment variable support
 fn default_bootstrap_servers() -> String {
     std::env::var("PGMQ_RELAY_KAFKA_BOOTSTRAP_SERVERS")
         .unwrap_or_else(|_| "localhost:9092".to_string())
@@ -161,15 +160,26 @@ impl KafkaTransactionConfig {
 }
 
 impl TransactionalIdStrategy {
-    /// Generate a unique transactional ID based on the strategy
-    pub fn generate_id(&self) -> String {
+    /// Generate a transactional ID based on the strategy.
+    ///
+    /// `instance_id` is a stable, per-worker identifier (the worker name) used to keep
+    /// IDs both stable across restarts (required for Kafka zombie fencing and
+    /// transaction recovery) and unique across workers sharing the same broker config.
+    pub fn generate_id(&self, instance_id: &str) -> String {
+        let safe_instance = sanitize_for_tx_id(instance_id);
         match self {
+            // Stable across restarts: "{prefix}-{hostname}-{instance}" with NO random
+            // component, so a restarted relay reuses the same transactional.id and Kafka
+            // can fence zombies and recover in-flight transactions.
             TransactionalIdStrategy::Hostname { prefix } => {
                 let hostname = get_hostname();
                 let base = prefix.as_deref().unwrap_or("pgmq-relay");
-                format!("{}-{}-{}", base, hostname, uuid::Uuid::new_v4())
+                format!("{}-{}-{}", base, hostname, safe_instance)
             }
-            TransactionalIdStrategy::Static { id } => id.clone(),
+            // Static base, made unique per worker so parallelism > 1 does not cause
+            // workers to fence each other while remaining stable across restarts.
+            TransactionalIdStrategy::Static { id } => format!("{}-{}", id, safe_instance),
+            // Explicitly opt-in unstable: random UUID each startup (no fencing).
             TransactionalIdStrategy::Random { prefix } => {
                 let base = prefix.as_deref().unwrap_or("pgmq-relay");
                 format!("{}-{}", base, uuid::Uuid::new_v4())
@@ -178,9 +188,23 @@ impl TransactionalIdStrategy {
     }
 }
 
+/// Sanitize an identifier so it is safe to embed in a Kafka transactional.id.
+fn sanitize_for_tx_id(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    cleaned.trim_matches('-').to_string()
+}
+
 /// Get hostname for transaction ID naming
 fn get_hostname() -> String {
-    // Try various hostname sources in order of preference
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("POD_NAME"))
         .or_else(|_| std::env::var("CONTAINER_NAME"))
@@ -212,12 +236,10 @@ fn default_transaction_retries() -> u32 {
 
 impl Validator for KafkaConfig {
     fn validate(&self) -> Result<(), String> {
-        // Validate bootstrap servers
         if self.bootstrap_servers.trim().is_empty() {
             return Err("bootstrap_servers cannot be empty".to_string());
         }
 
-        // Validate transaction configuration
         if self.transactions.is_enabled() {
             let timeout = self.transactions.get_timeout_ms();
             if timeout < 1000 || timeout > 300000 {
@@ -251,16 +273,13 @@ impl KafkaBroker {
             return f().await;
         }
 
-        // Start transaction
         tracing::trace!("Beginning Kafka transaction");
         self.producer
             .begin_transaction()
             .map_err(|e| RelayError::BrokerSend(format!("Failed to begin transaction: {}", e)))?;
 
-        // Execute the operation
         let result = f().await;
 
-        // Commit or abort based on result
         match result {
             Ok(value) => {
                 tracing::trace!("Committing Kafka transaction");
@@ -286,7 +305,7 @@ impl KafkaBroker {
         }
     }
 
-    pub fn new(_name: &str, config: &KafkaConfig) -> Result<Self, RelayError> {
+    pub fn new(_name: &str, config: &KafkaConfig, instance_id: &str) -> Result<Self, RelayError> {
         let (producer, supports_transactions) = {
             let mut client_config = ClientConfig::new();
 
@@ -296,15 +315,13 @@ impl KafkaBroker {
             client_config.set("queue.buffering.max.kbytes", "1048576");
             client_config.set("batch.num.messages", "1000");
 
-            // Configure transactions if enabled
             let supports_transactions = config.transactions.is_enabled();
             if supports_transactions {
-                // Generate transactional ID using the configured strategy
                 let unique_tx_id = if let Some(strategy) = config.transactions.get_strategy() {
-                    strategy.generate_id()
+                    strategy.generate_id(instance_id)
                 } else {
                     // Fallback (should not happen due to default)
-                    format!("pgmq-relay-{}", uuid::Uuid::new_v4())
+                    format!("pgmq-relay-{}", sanitize_for_tx_id(instance_id))
                 };
 
                 client_config.set("transactional.id", &unique_tx_id);
@@ -361,7 +378,6 @@ impl KafkaBroker {
                 .create()
                 .map_err(|e| RelayError::BrokerConfiguration(e.to_string()))?;
 
-            // Initialize transactions if enabled
             if supports_transactions {
                 info!("Initializing Kafka transactions...");
                 producer
@@ -402,7 +418,6 @@ impl MessageBroker for KafkaBroker {
         let message_count = messages.len();
         info!("Sending {} messages to topic '{}'", message_count, topic);
 
-        // Use the transaction wrapper for clean transaction management
         let result = self
             .with_transaction(|| {
                 let messages_clone = messages.to_vec();
@@ -425,7 +440,6 @@ impl MessageBroker for KafkaBroker {
                     let mut futures = Vec::new();
 
                     for (i, message) in messages_clone.iter().enumerate() {
-                        // Build headers correctly by accumulating all headers into one OwnedHeaders instance
                         let headers = message.headers.iter().fold(
                             OwnedHeaders::new(),
                             |acc, (key, value)| {
@@ -477,7 +491,6 @@ impl MessageBroker for KafkaBroker {
                     }
 
                     if !failed_message_ids.is_empty() {
-                        // Return error to trigger transaction rollback
                         return Err(RelayError::BrokerSend(format!(
                             "Failed to send {} out of {} messages to topic '{}'",
                             failed_message_ids.len(),
@@ -491,7 +504,6 @@ impl MessageBroker for KafkaBroker {
                         success_count, topic_clone
                     );
 
-                    // If we get here, all messages succeeded
                     Ok(SendResult {
                         successful_message_ids,
                         failed_messages: Vec::new(),
@@ -511,7 +523,6 @@ impl MessageBroker for KafkaBroker {
             Err(e) => {
                 warn!("Failed to send messages to topic '{}': {}", topic, e);
 
-                // When transaction fails, ALL messages are considered failed
                 let all_failed: Vec<(i64, String)> = messages
                     .iter()
                     .map(|m| (m.id, "Transaction failed".to_string()))

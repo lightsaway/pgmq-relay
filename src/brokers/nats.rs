@@ -281,6 +281,27 @@ impl MessageBroker for NatsBroker {
             }
         }
 
+        // For core NATS, publish() only buffers to the local connection; it returns no
+        // server acknowledgement. We must flush to push the buffer to the server (a
+        // PING/PONG round-trip) before we can treat the messages as delivered - otherwise
+        // a connection drop would lose messages we already deleted from PGMQ. JetStream
+        // already waited for per-message acks above, so it does not need this.
+        if self.jetstream.is_none() && !successful_ids.is_empty() {
+            if let Err(e) = self.client.flush().await {
+                error!(
+                    broker = %self.name,
+                    subject = %topic,
+                    error = %e,
+                    "Core NATS flush failed - treating all buffered messages as failed"
+                );
+                // We cannot prove any buffered message reached the server: fail them all
+                // so they are retried rather than silently dropped.
+                for id in successful_ids.drain(..) {
+                    failed_messages.push((id, format!("NATS flush failed: {}", e)));
+                }
+            }
+        }
+
         let duration = start_time.elapsed();
 
         if !failed_messages.is_empty() {
@@ -308,7 +329,32 @@ impl MessageBroker for NatsBroker {
     }
 
     async fn health_check(&self) -> Result<(), RelayError> {
-        // figure out proper way to healthcheck
-        Ok(())
+        use async_nats::connection::State;
+
+        // Check the current connection state, then actively flush as a liveness probe
+        // (round-trips to the server). async-nats reconnects in the background, so a
+        // transient Disconnected is not necessarily fatal, but a failed flush is.
+        match self.client.connection_state() {
+            State::Connected => {}
+            State::Pending => {
+                return Err(RelayError::BrokerHealthCheck(format!(
+                    "NATS broker '{}' connection is pending (not yet connected)",
+                    self.name
+                )));
+            }
+            State::Disconnected => {
+                return Err(RelayError::BrokerHealthCheck(format!(
+                    "NATS broker '{}' is disconnected",
+                    self.name
+                )));
+            }
+        }
+
+        self.client.flush().await.map_err(|e| {
+            RelayError::BrokerHealthCheck(format!(
+                "NATS broker '{}' flush/ping failed: {}",
+                self.name, e
+            ))
+        })
     }
 }

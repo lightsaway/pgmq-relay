@@ -85,17 +85,14 @@ impl Default for RabbitMQConfig {
 
 impl Validator for RabbitMQConfig {
     fn validate(&self) -> Result<(), String> {
-        // Validate AMQP URL
         if self.url.trim().is_empty() {
             return Err("RabbitMQ URL cannot be empty".to_string());
         }
 
-        // Validate delivery mode
         if self.delivery_mode != 1 && self.delivery_mode != 2 {
             return Err("delivery_mode must be 1 (non-persistent) or 2 (persistent)".to_string());
         }
 
-        // Validate pool size
         if self.pool_size == 0 {
             return Err("pool_size must be greater than 0".to_string());
         }
@@ -104,15 +101,89 @@ impl Validator for RabbitMQConfig {
     }
 }
 
+/// A live connection plus its pool of publish channels.
+struct ConnectionPool {
+    connection: Connection,
+    channels: Vec<Channel>,
+    /// Round-robin cursor for spreading publishes across channels.
+    next: usize,
+}
+
 /// RabbitMQ broker implementation
 pub struct RabbitMQBroker {
     name: String,
     config: RabbitMQConfig,
-    connection: Connection,
-    channel: Channel,
+    /// Interior mutability so `send_batch` (which takes `&self`) can rebuild the
+    /// connection on failure and advance the round-robin cursor.
+    pool: tokio::sync::Mutex<ConnectionPool>,
 }
 
 impl RabbitMQBroker {
+    /// Establish a connection and a pool of `pool_size` channels, each with publisher
+    /// confirms enabled, and declare the exchange once.
+    async fn connect(config: &RabbitMQConfig) -> Result<ConnectionPool, RelayError> {
+        let connection = Connection::connect(&config.url, ConnectionProperties::default())
+            .await
+            .map_err(|e| {
+                RelayError::BrokerConfiguration(format!("Failed to connect to RabbitMQ: {}", e))
+            })?;
+
+        let mut channels = Vec::with_capacity(config.pool_size);
+        for i in 0..config.pool_size {
+            let channel = connection.create_channel().await.map_err(|e| {
+                RelayError::BrokerConfiguration(format!("Failed to create channel: {}", e))
+            })?;
+
+            // Enable publisher confirms on this channel. Without this, the confirm future
+            // returned by basic_publish resolves to `NotRequested` immediately, giving a
+            // fake ack and risking silent message loss.
+            channel
+                .confirm_select(ConfirmSelectOptions::default())
+                .await
+                .map_err(|e| {
+                    RelayError::BrokerConfiguration(format!(
+                        "Failed to enable publisher confirms on channel {}: {}",
+                        i, e
+                    ))
+                })?;
+
+            // Declare the exchange once (on the first channel) if configured.
+            if i == 0 && config.declare_exchange && !config.exchange.is_empty() {
+                channel
+                    .exchange_declare(
+                        &config.exchange,
+                        lapin::ExchangeKind::Custom(config.exchange_type.clone()),
+                        ExchangeDeclareOptions {
+                            durable: config.durable,
+                            auto_delete: config.auto_delete,
+                            ..Default::default()
+                        },
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        RelayError::BrokerConfiguration(format!(
+                            "Failed to declare exchange: {}",
+                            e
+                        ))
+                    })?;
+
+                info!(
+                    "Declared exchange '{}' of type '{}'",
+                    config.exchange, config.exchange_type
+                );
+            }
+
+            channels.push(channel);
+        }
+
+        Ok(ConnectionPool {
+            connection,
+            channels,
+            next: 0,
+        })
+    }
+
     /// Create a new RabbitMQ broker
     pub async fn new(name: &str, config: &RabbitMQConfig) -> Result<Self, RelayError> {
         info!(
@@ -120,49 +191,18 @@ impl RabbitMQBroker {
             name, config.url
         );
 
-        // Create connection
-        let connection = Connection::connect(&config.url, ConnectionProperties::default())
-            .await
-            .map_err(|e| {
-                RelayError::BrokerConfiguration(format!("Failed to connect to RabbitMQ: {}", e))
-            })?;
+        let pool = Self::connect(config).await?;
 
-        // Create channel
-        let channel = connection.create_channel().await.map_err(|e| {
-            RelayError::BrokerConfiguration(format!("Failed to create channel: {}", e))
-        })?;
-
-        // Declare exchange if configured
-        if config.declare_exchange && !config.exchange.is_empty() {
-            channel
-                .exchange_declare(
-                    &config.exchange,
-                    lapin::ExchangeKind::Custom(config.exchange_type.clone()),
-                    ExchangeDeclareOptions {
-                        durable: config.durable,
-                        auto_delete: config.auto_delete,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .map_err(|e| {
-                    RelayError::BrokerConfiguration(format!("Failed to declare exchange: {}", e))
-                })?;
-
-            info!(
-                "Declared exchange '{}' of type '{}'",
-                config.exchange, config.exchange_type
-            );
-        }
-
-        info!("RabbitMQ broker '{}' initialized successfully", name);
+        info!(
+            "RabbitMQ broker '{}' initialized successfully with {} channel(s)",
+            name,
+            config.pool_size
+        );
 
         Ok(Self {
             name: name.to_string(),
             config: config.clone(),
-            connection,
-            channel,
+            pool: tokio::sync::Mutex::new(pool),
         })
     }
 
@@ -186,6 +226,13 @@ impl MessageBroker for RabbitMQBroker {
         topic: &str,
         messages: &[RelayMessage],
     ) -> Result<SendResult, RelayError> {
+        if messages.is_empty() {
+            return Ok(SendResult {
+                successful_message_ids: Vec::new(),
+                failed_messages: Vec::new(),
+            });
+        }
+
         let start_time = Instant::now();
         let mut successful_ids = Vec::new();
         let mut failed_messages = Vec::new();
@@ -197,21 +244,52 @@ impl MessageBroker for RabbitMQBroker {
             "Sending batch to RabbitMQ"
         );
 
+        let mut pool = self.pool.lock().await;
+
+        // Reconnect if the connection has dropped. lapin does not auto-recover, so without
+        // this every send after a disconnect would fail forever.
+        if !pool.connection.status().connected() {
+            warn!(
+                broker = %self.name,
+                "RabbitMQ connection is down - attempting to reconnect"
+            );
+            match Self::connect(&self.config).await {
+                Ok(new_pool) => {
+                    *pool = new_pool;
+                    info!(broker = %self.name, "RabbitMQ reconnected");
+                }
+                Err(e) => {
+                    error!(broker = %self.name, error = %e, "RabbitMQ reconnect failed");
+                    let all_failed = messages
+                        .iter()
+                        .map(|m| (m.id, format!("Reconnect failed: {}", e)))
+                        .collect();
+                    return Ok(SendResult {
+                        successful_message_ids: Vec::new(),
+                        failed_messages: all_failed,
+                    });
+                }
+            }
+        }
+
+        let channel_count = pool.channels.len();
+
+        // Phase 1: issue all publishes (spread across the channel pool), collecting the
+        // confirm futures. Phase 2 awaits the broker confirms. This pipelines confirms
+        // across the pool instead of round-tripping per message.
+        let mut pending = Vec::with_capacity(messages.len());
         for message in messages {
-            // Use message key as routing key, or topic as fallback
             let routing_key = message.key.as_deref().unwrap_or(topic);
-
-            // Convert headers to AMQP format
             let amqp_headers = Self::convert_headers(&message.headers);
-
-            // Create basic properties
             let properties = BasicProperties::default()
                 .with_delivery_mode(self.config.delivery_mode)
                 .with_headers(amqp_headers);
 
-            // Publish message
-            let result = self
-                .channel
+            let idx = pool.next % channel_count;
+            pool.next = pool.next.wrapping_add(1);
+            let channel = &pool.channels[idx];
+
+            match channel
                 .basic_publish(
                     &self.config.exchange,
                     routing_key,
@@ -219,33 +297,9 @@ impl MessageBroker for RabbitMQBroker {
                     &message.payload,
                     properties,
                 )
-                .await;
-
-            match result {
-                Ok(confirmation) => {
-                    // Wait for confirmation
-                    match confirmation.await {
-                        Ok(_) => {
-                            debug!(
-                                broker = %self.name,
-                                msg_id = message.id,
-                                routing_key = %routing_key,
-                                "Message published successfully"
-                            );
-                            successful_ids.push(message.id);
-                        }
-                        Err(e) => {
-                            error!(
-                                broker = %self.name,
-                                msg_id = message.id,
-                                error = %e,
-                                "Failed to confirm message"
-                            );
-                            failed_messages
-                                .push((message.id, format!("Confirmation failed: {}", e)));
-                        }
-                    }
-                }
+                .await
+            {
+                Ok(confirm) => pending.push((message.id, Some(confirm))),
                 Err(e) => {
                     error!(
                         broker = %self.name,
@@ -254,6 +308,36 @@ impl MessageBroker for RabbitMQBroker {
                         "Failed to publish message"
                     );
                     failed_messages.push((message.id, format!("Publish failed: {}", e)));
+                }
+            }
+        }
+
+        // Phase 2: await broker confirmations.
+        for (msg_id, confirm) in pending {
+            let confirm = match confirm {
+                Some(c) => c,
+                None => continue,
+            };
+            match confirm.await {
+                Ok(confirmation) if confirmation.is_nack() => {
+                    error!(
+                        broker = %self.name,
+                        msg_id = msg_id,
+                        "Message was nack'd by RabbitMQ"
+                    );
+                    failed_messages.push((msg_id, "Message nack'd by broker".to_string()));
+                }
+                Ok(_) => {
+                    successful_ids.push(msg_id);
+                }
+                Err(e) => {
+                    error!(
+                        broker = %self.name,
+                        msg_id = msg_id,
+                        error = %e,
+                        "Failed to confirm message"
+                    );
+                    failed_messages.push((msg_id, format!("Confirmation failed: {}", e)));
                 }
             }
         }
@@ -285,13 +369,14 @@ impl MessageBroker for RabbitMQBroker {
     }
 
     async fn health_check(&self) -> Result<(), RelayError> {
-        // Check if connection is still open
-        if self.connection.status().connected() {
+        let pool = self.pool.lock().await;
+        if pool.connection.status().connected() {
             Ok(())
         } else {
-            Err(RelayError::BrokerHealthCheck(
-                "RabbitMQ connection is not connected".to_string(),
-            ))
+            Err(RelayError::BrokerHealthCheck(format!(
+                "RabbitMQ broker '{}' connection is not connected",
+                self.name
+            )))
         }
     }
 }
