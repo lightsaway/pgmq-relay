@@ -134,13 +134,15 @@ services:
     depends_on:
       nats:
         condition: service_healthy
-    environment:
-      NATS_URL: nats://nats:4222
-      NATS_MONITOR_URL: http://nats:8222
     ports:
       - "31311:31311" # NATS UI
+    volumes:
+      - nats_ui_data:/root/.config/nui # Persist connections
     networks:
       - pgmq-network
+    # Note: On first launch, manually add connection:
+    # URL: nats://nats:4222
+    # Name: Local NATS
 
   # PGMQ Relay Application
   pgmq-relay:
@@ -210,6 +212,8 @@ volumes:
   rabbitmq_data:
     driver: local
   nats_data:
+    driver: local
+  nats_ui_data:
     driver: local
 
 networks:
