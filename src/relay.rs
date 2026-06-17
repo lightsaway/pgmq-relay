@@ -1,12 +1,15 @@
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::broker::{create_broker, MessageBroker};
 use crate::config::{Config, WorkerConfig};
 use crate::error::RelayError;
+use crate::health::HealthState;
 use crate::metrics_service::{
     self as metrics, MetricsService, OperationContext, SystemMetric, WorkerOperation,
 };
@@ -16,21 +19,30 @@ use crate::transformer::MessageTransformer;
 pub struct Relay {
     config: Config,
     pgmq_client: Arc<dyn PgmqClient>,
-    shutdown_tx: Option<mpsc::Sender<()>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
     worker_handles: Vec<JoinHandle<()>>,
+    worker_exit_tx: mpsc::UnboundedSender<WorkerExit>,
+    worker_exit_rx: mpsc::UnboundedReceiver<WorkerExit>,
+    background_handles: Vec<JoinHandle<()>>,
     metrics_service: Arc<dyn MetricsService>,
+    health: HealthState,
+}
+
+struct WorkerExit {
+    name: String,
+    result: Result<(), RelayError>,
 }
 
 impl Relay {
     pub async fn new(
         config: Config,
         metrics_service: Arc<dyn MetricsService>,
+        health: HealthState,
     ) -> Result<Self, RelayError> {
         info!("Initializing PGMQ Relay");
 
         let pgmq_client = Arc::new(PgmqClientImpl::new(&config.pgmq).await?);
 
-        // Validate that all worker broker configs exist
         let workers = config.get_workers();
         for worker_config in &workers {
             if !config.brokers.contains_key(&worker_config.broker_name) {
@@ -43,12 +55,18 @@ impl Relay {
 
         info!("All broker configurations validated");
 
+        let (worker_exit_tx, worker_exit_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             config,
             pgmq_client,
             shutdown_tx: None,
             worker_handles: Vec::new(),
+            worker_exit_tx,
+            worker_exit_rx,
+            background_handles: Vec::new(),
             metrics_service,
+            health,
         })
     }
 
@@ -61,10 +79,17 @@ impl Relay {
             total_queues
         );
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        // Broadcast shutdown via a watch channel: every worker owns its own receiver, so
+        // workers run fully concurrently. (The previous Arc<RwLock<mpsc::Receiver>> was
+        // held across each worker's entire processing iteration, serializing all workers
+        // and silently defeating `parallelism`.)
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let shutdown_rx = Arc::new(RwLock::new(shutdown_rx));
+        // One representative broker connection per broker name, kept for the periodic
+        // health monitor so `broker_health_check_status` reflects live state (not just the
+        // value captured at startup).
+        let mut monitored_brokers: Vec<(String, String, Arc<dyn MessageBroker>)> = Vec::new();
 
         for worker_config in &workers {
             let broker_config = self
@@ -78,17 +103,24 @@ impl Relay {
                     ))
                 })?;
 
-            // Create a dedicated broker instance for this worker
+            // Create a dedicated broker instance for this worker. The worker name is a
+            // stable, unique instance id used (e.g. by Kafka) to derive a transactional
+            // id that survives restarts and does not collide across parallel workers.
             debug!(
                 "Creating dedicated broker instance for worker '{}'",
                 worker_config.name
             );
-            let worker_broker = create_broker(&worker_config.broker_name, broker_config).await?;
+            let worker_broker: Arc<dyn MessageBroker> = Arc::from(
+                create_broker(
+                    &worker_config.broker_name,
+                    broker_config,
+                    &worker_config.name,
+                )
+                .await?,
+            );
 
-            // Health check the worker's broker
             let health_check_result = worker_broker.health_check().await;
 
-            // Record health check metrics
             let broker_type = broker_config.broker_type();
             match &health_check_result {
                 Ok(_) => {
@@ -106,25 +138,58 @@ impl Relay {
                 ))
             })?;
 
+            if !monitored_brokers
+                .iter()
+                .any(|(name, _, _)| name == &worker_config.broker_name)
+            {
+                monitored_brokers.push((
+                    worker_config.broker_name.clone(),
+                    broker_type.to_string(),
+                    Arc::clone(&worker_broker),
+                ));
+            }
+
             let worker = RelayWorker {
                 worker_config: worker_config.clone(),
                 pgmq_client: Arc::clone(&self.pgmq_client),
-                broker: Arc::from(worker_broker),
+                broker: Arc::clone(&worker_broker),
                 broker_type: broker_config.broker_type().to_string(),
-                shutdown_rx: Arc::clone(&shutdown_rx),
+                shutdown_rx: shutdown_rx.clone(),
                 metrics_service: Arc::clone(&self.metrics_service),
             };
 
+            let worker_exit_tx = self.worker_exit_tx.clone();
             let handle = tokio::spawn(async move {
+                let worker_name = worker.worker_config.name.clone();
                 worker
                     .metrics_service
                     .record_system_metric(SystemMetric::WorkerCount(1));
-                if let Err(e) = worker.run().await {
-                    error!("Worker '{}' failed: {}", worker.worker_config.name, e);
+                let result = match AssertUnwindSafe(worker.run()).catch_unwind().await {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let panic_message = if let Some(message) = payload.downcast_ref::<&str>() {
+                            (*message).to_string()
+                        } else if let Some(message) = payload.downcast_ref::<String>() {
+                            message.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        Err(RelayError::Configuration(format!(
+                            "worker panicked: {}",
+                            panic_message
+                        )))
+                    }
+                };
+                if let Err(e) = &result {
+                    error!("Worker '{}' failed: {}", worker_name, e);
                 }
                 worker
                     .metrics_service
                     .record_system_metric(SystemMetric::WorkerCount(-1));
+                let _ = worker_exit_tx.send(WorkerExit {
+                    name: worker_name,
+                    result,
+                });
             });
 
             self.worker_handles.push(handle);
@@ -149,6 +214,50 @@ impl Relay {
                 worker_config.name, worker_config.broker_name, worker_config.queue.queue_name
             );
         }
+
+        // Mark the service started and keep the readiness probe in sync with the PGMQ
+        // client's ability to complete processing (its deletion circuit-breaker state).
+        self.health.set_started(true);
+        self.health
+            .set_pgmq_ready(self.pgmq_client.is_ready_to_process());
+
+        let health = self.health.clone();
+        let pgmq_client = Arc::clone(&self.pgmq_client);
+        let mut readiness_shutdown = shutdown_rx.clone();
+        let readiness_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = readiness_shutdown.changed() => break,
+                    _ = interval.tick() => {
+                        health.set_pgmq_ready(pgmq_client.is_ready_to_process());
+                    }
+                }
+            }
+        });
+        self.background_handles.push(readiness_handle);
+
+        // Periodically re-check each broker's health so `broker_health_check_status`
+        // tracks live state and alerts on a broker going down actually fire.
+        if !monitored_brokers.is_empty() {
+            let mut broker_shutdown = shutdown_rx.clone();
+            let broker_handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(15));
+                loop {
+                    tokio::select! {
+                        _ = broker_shutdown.changed() => break,
+                        _ = interval.tick() => {
+                            for (name, broker_type, broker) in &monitored_brokers {
+                                let healthy = broker.health_check().await.is_ok();
+                                metrics::record_broker_health(name, broker_type, healthy);
+                            }
+                        }
+                    }
+                }
+            });
+            self.background_handles.push(broker_handle);
+        }
+
         Ok(())
     }
 
@@ -156,38 +265,71 @@ impl Relay {
         info!("Shutting down PGMQ Relay");
 
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(()).await;
+            let _ = shutdown_tx.send(true);
         }
 
-        let shutdown_future = async {
-            for handle in self.worker_handles.drain(..) {
-                if let Err(e) = handle.await {
-                    warn!("Worker shutdown error: {}", e);
-                }
-            }
-        };
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        tokio::select! {
-            _ = shutdown_future => {
-                info!("All workers shut down successfully");
-                Ok(())
-            }
-            _ = tokio::time::sleep(timeout) => {
-                warn!("Shutdown timeout reached, aborting remaining workers");
-                for handle in &self.worker_handles {
-                    handle.abort();
-                }
-                Err(RelayError::ShutdownTimeout)
-            }
-        }
+        join_task_handles(&mut self.worker_handles, deadline, "Worker").await?;
+        join_task_handles(&mut self.background_handles, deadline, "Background task").await?;
+
+        info!("All workers shut down successfully");
+        Ok(())
     }
 
     pub async fn wait_for_shutdown(&mut self) -> Result<(), RelayError> {
-        for handle in self.worker_handles.drain(..) {
-            handle.await?;
+        match self.worker_exit_rx.recv().await {
+            Some(exit) => match exit.result {
+                Ok(()) => Err(RelayError::Configuration(format!(
+                    "Worker '{}' exited unexpectedly",
+                    exit.name
+                ))),
+                Err(e) => Err(RelayError::Configuration(format!(
+                    "Worker '{}' failed: {}",
+                    exit.name, e
+                ))),
+            },
+            None => Err(RelayError::Configuration(
+                "Worker supervisor channel closed".to_string(),
+            )),
         }
-        Ok(())
     }
+}
+
+async fn join_task_handles(
+    handles: &mut Vec<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+    task_kind: &str,
+) -> Result<(), RelayError> {
+    while let Some(mut handle) = handles.pop() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            handle.abort();
+            for handle in handles.iter() {
+                handle.abort();
+            }
+            return Err(RelayError::ShutdownTimeout);
+        }
+
+        tokio::select! {
+            result = &mut handle => {
+                if let Err(e) = result {
+                    warn!("{} shutdown error: {}", task_kind, e);
+                }
+            }
+            _ = tokio::time::sleep(remaining) => {
+                warn!("Shutdown timeout reached, aborting remaining {} tasks", task_kind);
+                handle.abort();
+                let _ = handle.await;
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+                return Err(RelayError::ShutdownTimeout);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct RelayWorker {
@@ -195,7 +337,7 @@ struct RelayWorker {
     pgmq_client: Arc<dyn PgmqClient>,
     broker: Arc<dyn MessageBroker>,
     broker_type: String,
-    shutdown_rx: Arc<RwLock<mpsc::Receiver<()>>>,
+    shutdown_rx: watch::Receiver<bool>,
     metrics_service: Arc<dyn MetricsService>,
 }
 
@@ -207,11 +349,12 @@ impl RelayWorker {
             self.worker_config.name, queue_name
         );
 
-        loop {
-            let mut shutdown_rx = self.shutdown_rx.write().await;
+        // Own a local clone so we can await changes without sharing a lock with other workers.
+        let mut shutdown_rx = self.shutdown_rx.clone();
 
+        loop {
             tokio::select! {
-                _ = shutdown_rx.recv() => {
+                _ = shutdown_rx.changed() => {
                     info!("Shutdown signal received for worker '{}'", self.worker_config.name);
                     break;
                 }
@@ -269,14 +412,12 @@ impl RelayWorker {
             queue_messages.messages.len(),
         );
 
-        // If queue is empty, sleep for remaining poll interval time
         if queue_messages.messages.is_empty() {
             let poll_elapsed = poll_start_time.elapsed();
             if poll_elapsed < self.worker_config.poll_interval {
                 let remaining_sleep = self.worker_config.poll_interval - poll_elapsed;
                 tokio::time::sleep(remaining_sleep).await;
             }
-            // If poll took longer than interval, proceed immediately to next poll
             return Ok(());
         }
 
@@ -289,26 +430,34 @@ impl RelayWorker {
             "Processing message batch"
         );
 
+        // Transform messages, isolating poison messages so one bad message cannot fail the
+        // whole batch (head-of-line blocking). Failures are collected with their error and
+        // handled after the readiness gate (dead-lettered or left to retry).
         let mut relay_messages = Vec::new();
+        let mut transform_failed: Vec<(&crate::pgmq_client::PgmqMessageWithHeaders, String)> =
+            Vec::new();
 
         for message in &queue_messages.messages {
-            let relay_message = MessageTransformer::transform_message_with_global_metrics(
+            match MessageTransformer::transform_message_with_global_metrics(
                 &message.message,
                 &message.headers,
                 message.msg_id,
                 &queue_config.message_transformation,
                 &queue_config.queue_name,
                 &queue_config.key_field,
-            )
-            .map_err(|e| {
-                error!(
-                    "Failed to transform message {} from queue '{}': {}",
-                    message.msg_id, queue_config.queue_name, e
-                );
-                e
-            })?;
-
-            relay_messages.push(relay_message);
+            ) {
+                Ok(relay_message) => relay_messages.push(relay_message),
+                Err(e) => {
+                    error!(
+                        worker = %self.worker_config.name,
+                        msg_id = message.msg_id,
+                        queue = %queue_config.queue_name,
+                        error = %e,
+                        "Failed to transform message - isolating as poison message"
+                    );
+                    transform_failed.push((message, e.to_string()));
+                }
+            }
         }
 
         let destination_topic = queue_config.effective_destination_topic().to_string();
@@ -333,65 +482,109 @@ impl RelayWorker {
             return Ok(());
         }
 
-        let send_start_time = Instant::now();
-        let send_result = self
-            .broker
-            .send_batch(&destination_topic, &relay_messages)
-            .await
-            .map_err(|e| {
-                error!("Failed to send batch to broker: {}", e);
-                e
-            })?;
-        let send_duration = send_start_time.elapsed();
+        // msg_ids that have been fully handled and can be removed from the source queue:
+        // either delivered to the broker or routed to the dead-letter queue.
+        let mut ids_to_complete: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-        let total_messages_sent = queue_messages.messages.len();
-        let send_success = send_result.failed_messages.is_empty();
+        // Route poison messages to the dead-letter queue if configured; otherwise leave
+        // them in the source queue (they retry after the visibility timeout without
+        // blocking the rest of the batch).
+        if !transform_failed.is_empty() {
+            match &queue_config.dead_letter_queue {
+                Some(dlq) => {
+                    for (message, err) in &transform_failed {
+                        match self
+                            .pgmq_client
+                            .send_to_dead_letter(
+                                dlq.as_str(),
+                                &queue_config.queue_name,
+                                message,
+                                err.as_str(),
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                ids_to_complete.insert(message.msg_id);
+                            }
+                            Err(e) => {
+                                error!(
+                                    worker = %self.worker_config.name,
+                                    msg_id = message.msg_id,
+                                    error = %e,
+                                    "Failed to route poison message to dead-letter queue - will retry"
+                                );
+                            }
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        worker = %self.worker_config.name,
+                        failed = transform_failed.len(),
+                        "{} message(s) failed transformation and no dead_letter_queue is \
+                         configured; leaving them for retry after the visibility timeout",
+                        transform_failed.len()
+                    );
+                }
+            }
+        }
 
-        // Record broker send metrics
-        metrics::record_broker_send(
-            &self.worker_config.broker_name,
-            &self.broker_type,
-            &destination_topic,
-            send_duration.as_secs_f64(),
-            total_messages_sent,
-            send_success,
-        );
+        if !relay_messages.is_empty() {
+            let send_start_time = Instant::now();
+            let send_result = self
+                .broker
+                .send_batch(&destination_topic, &relay_messages)
+                .await
+                .map_err(|e| {
+                    error!("Failed to send batch to broker: {}", e);
+                    e
+                })?;
+            let send_duration = send_start_time.elapsed();
 
-        trace!(
-            worker = %self.worker_config.name,
-            succeeded = send_result.successful_message_ids.len(),
-            failed = send_result.failed_messages.len(),
-            "Broker delivery completed"
-        );
+            let send_success = send_result.failed_messages.is_empty();
 
-        // Only complete messages that were successfully sent to broker
+            metrics::record_broker_send(
+                &self.worker_config.broker_name,
+                &self.broker_type,
+                &destination_topic,
+                send_duration.as_secs_f64(),
+                relay_messages.len(),
+                send_success,
+            );
+
+            trace!(
+                worker = %self.worker_config.name,
+                succeeded = send_result.successful_message_ids.len(),
+                failed = send_result.failed_messages.len(),
+                "Broker delivery completed"
+            );
+
+            if !send_success {
+                warn!(
+                    worker = %self.worker_config.name,
+                    total = relay_messages.len(),
+                    succeeded = send_result.successful_message_ids.len(),
+                    failed = send_result.failed_messages.len(),
+                    "Partial send failure - only completing successfully sent messages"
+                );
+            }
+
+            ids_to_complete.extend(send_result.successful_message_ids.iter().copied());
+        }
+
+        // Complete (delete or archive) exactly the messages that were delivered to the
+        // broker or routed to the dead-letter queue. This is the only place messages are
+        // removed from the source queue, so transform failures left for retry are never
+        // accidentally deleted.
         let completion_start_time = Instant::now();
-        let messages_to_complete = if send_result.failed_messages.is_empty() {
-            // All messages sent successfully, complete all
-            queue_messages.messages.len()
-        } else {
-            // Partial failure - only complete successfully sent messages
-            let successful_ids: std::collections::HashSet<_> =
-                send_result.successful_message_ids.iter().collect();
-
+        let messages_to_complete = ids_to_complete.len();
+        if messages_to_complete > 0 {
             let filtered_messages: Vec<_> = queue_messages
                 .messages
                 .iter()
-                .filter(|m| successful_ids.contains(&m.msg_id))
+                .filter(|m| ids_to_complete.contains(&m.msg_id))
                 .cloned()
                 .collect();
-
-            let count = filtered_messages.len();
-
-            warn!(
-                worker = %self.worker_config.name,
-                total = total_messages_sent,
-                succeeded = count,
-                failed = send_result.failed_messages.len(),
-                "Partial send failure - only completing successfully sent messages"
-            );
-
-            // Create a filtered QueueMessages structure for completion
             let filtered_queue_messages = crate::pgmq_client::QueueMessages {
                 queue_name: queue_messages.queue_name.clone(),
                 messages: filtered_messages,
@@ -403,48 +596,11 @@ impl RelayWorker {
                 .await
             {
                 Ok(()) => {
-                    info!(
-                        worker = %self.worker_config.name,
-                        completed = count,
-                        "Successfully completed delivered messages"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        worker = %self.worker_config.name,
-                        error = %e,
-                        "Failed to complete successfully sent messages - may cause duplicates"
-                    );
-
-                    metrics::record_completion_failure(
-                        &self.worker_config.name,
-                        &queue_config.queue_name,
-                        queue_config.effective_destination_topic(),
-                        "pgmq_completion_error",
-                        completion_start_time.elapsed().as_secs_f64(),
-                        count,
-                    );
-                }
-            }
-
-            count
-        };
-
-        // Complete all messages if send was fully successful
-        if send_result.failed_messages.is_empty() {
-            match self
-                .pgmq_client
-                .complete_queue_messages(&queue_messages, queue_config)
-                .await
-            {
-                Ok(()) => {
                     let completion_duration = completion_start_time.elapsed();
-
                     let context = OperationContext {
                         queue_name: queue_config.queue_name.clone(),
                         destination_topic: queue_config.effective_destination_topic().to_string(),
                     };
-
                     self.metrics_service.record_worker_operation(
                         WorkerOperation::Complete,
                         &self.worker_config.name,
@@ -452,8 +608,11 @@ impl RelayWorker {
                         completion_duration,
                         messages_to_complete,
                     );
-
-                    info!("PGMQ completion successful");
+                    info!(
+                        worker = %self.worker_config.name,
+                        completed = messages_to_complete,
+                        "PGMQ completion successful"
+                    );
                 }
                 Err(e) => {
                     let completion_duration = completion_start_time.elapsed();
@@ -462,8 +621,6 @@ impl RelayWorker {
                         error = %e,
                         "Messages delivered to broker but failed to complete in PGMQ - may cause duplicates on retry"
                     );
-
-                    // Record critical failure metrics
                     metrics::record_completion_failure(
                         &self.worker_config.name,
                         &queue_config.queue_name,
@@ -478,7 +635,6 @@ impl RelayWorker {
 
         let processing_duration = start_time.elapsed().as_secs_f64();
 
-        // Record overall processing metrics
         metrics::record_worker_operation(
             &self.worker_config.name,
             "process",
@@ -488,16 +644,18 @@ impl RelayWorker {
             total_messages,
         );
 
-        // Count archived vs deleted messages for logging
+        // Count archived vs deleted messages for logging (only completed messages are
+        // removed from the source queue; transform failures left for retry are excluded).
         let (archived_count, deleted_count) = if queue_config.archive_messages {
-            (total_messages, 0)
+            (messages_to_complete, 0)
         } else {
-            (0, total_messages)
+            (0, messages_to_complete)
         };
 
         info!(
             worker = %self.worker_config.name,
             total_messages = total_messages,
+            completed = messages_to_complete,
             archived = archived_count,
             deleted = deleted_count,
             processing_duration_ms = processing_duration * 1000.0,

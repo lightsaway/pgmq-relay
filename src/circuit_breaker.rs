@@ -107,7 +107,15 @@ pub trait CircuitBreakerMetrics {
     fn record_success(&self, name: &str, duration: Duration, attempt: u32);
     fn record_failure(&self, name: &str, duration: Duration, attempt: u32, error_type: &str);
     fn record_rejection(&self, name: &str);
+    /// Record the breaker's current state as a gauge value: 0=closed, 1=open, 2=half-open.
+    /// Default no-op so metric-less implementations (e.g. tests) need not implement it.
+    fn record_state(&self, _name: &str, _state: f64) {}
 }
+
+/// Circuit-breaker state gauge values, shared with metric recorders.
+pub const CB_STATE_CLOSED: f64 = 0.0;
+pub const CB_STATE_OPEN: f64 = 1.0;
+pub const CB_STATE_HALF_OPEN: f64 = 2.0;
 
 impl<M> GenericCircuitBreaker<M>
 where
@@ -138,6 +146,14 @@ where
             )));
         }
 
+        // If the breaker is still over threshold but the recovery timeout has elapsed,
+        // this permitted call is a half-open trial.
+        if self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
+            >= self.config.failure_threshold
+        {
+            self.metrics.record_state(&self.name, CB_STATE_HALF_OPEN);
+        }
+
         let mut backoff = self.create_backoff();
         let mut attempt = 1;
 
@@ -148,7 +164,6 @@ where
                 Ok(result) => {
                     let duration = start_time.elapsed();
 
-                    // Record success and reset failure count
                     self.on_success();
                     self.metrics.record_success(&self.name, duration, attempt);
 
@@ -166,12 +181,19 @@ where
                 Err(e) => {
                     let duration = start_time.elapsed();
 
-                    // Record failure
                     self.on_error();
                     self.metrics
                         .record_failure(&self.name, duration, attempt, &format!("{}", e));
 
-                    // Check if we should retry
+                    // If this failure pushed the breaker over the threshold, surface the
+                    // open state on the gauge immediately (rather than only on the next
+                    // rejected call).
+                    if self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
+                        >= self.config.failure_threshold
+                    {
+                        self.metrics.record_state(&self.name, CB_STATE_OPEN);
+                    }
+
                     if attempt >= self.config.max_retries {
                         warn!(
                             circuit_breaker = %self.name,
@@ -183,7 +205,6 @@ where
                         return Err(e);
                     }
 
-                    // Check if the circuit breaker has opened
                     if !self.is_call_permitted() {
                         warn!(
                             circuit_breaker = %self.name,
@@ -197,7 +218,6 @@ where
                         )));
                     }
 
-                    // Calculate delay with exponential backoff
                     if let Some(delay) = backoff.next_backoff() {
                         warn!(
                             circuit_breaker = %self.name,
@@ -210,7 +230,6 @@ where
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                     } else {
-                        // Backoff exhausted
                         return Err(e);
                     }
                 }
@@ -225,7 +244,6 @@ where
             .load(std::sync::atomic::Ordering::Relaxed);
 
         if failure_count >= self.config.failure_threshold {
-            // Check if enough time has passed for recovery
             if let Ok(last_failure) = self.last_failure_time.lock() {
                 if let Some(last_failure_instant) = *last_failure {
                     let elapsed = last_failure_instant.elapsed();
@@ -243,7 +261,6 @@ where
 
     /// Record a successful operation
     fn on_success(&self) {
-        // Reset failure count on success
         self.failure_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut last_failure) = self.last_failure_time.lock() {
@@ -264,9 +281,24 @@ where
         }
     }
 
-    /// Get current circuit breaker state for monitoring
+    /// Build an exponential backoff from the configured parameters.
+    ///
+    /// Previously this returned `ExponentialBackoff::default()`, silently ignoring
+    /// `initial_delay`, `max_delay`, `multiplier`, and `jitter`. It now honors them.
     fn create_backoff(&self) -> ExponentialBackoff {
-        ExponentialBackoff::default()
+        let mut backoff = ExponentialBackoff {
+            initial_interval: self.config.initial_delay,
+            current_interval: self.config.initial_delay,
+            multiplier: self.config.multiplier,
+            max_interval: self.config.max_delay,
+            randomization_factor: self.config.jitter,
+            // Bound total retry time so a single operation cannot retry forever; the
+            // per-operation retry count is also capped by `max_retries` in `execute`.
+            max_elapsed_time: Some(self.config.max_delay.saturating_mul(self.config.max_retries.max(1))),
+            ..ExponentialBackoff::default()
+        };
+        backoff.reset();
+        backoff
     }
 }
 

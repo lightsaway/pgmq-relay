@@ -1,0 +1,21 @@
+[book]
+title = "PGMQ Relay"
+description = "Documentation for pgmq-relay, a Rust service that forwards PGMQ messages to Kafka, RabbitMQ, and NATS."
+authors = ["PGMQ Relay Maintainers"]
+language = "en"
+src = "site/src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/lightsaway/pgmq-relay"
+edit-url-template = "https://github.com/lightsaway/pgmq-relay/edit/main/{path}"
+site-url = "/pgmq-relay/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+
+[output.html.print]
+enable = true

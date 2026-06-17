@@ -1,7 +1,7 @@
 services:
   # PostgreSQL with PGMQ extension
   postgres:
-    image: ghcr.io/pgmq/pg18-pgmq:v1.9.0
+    image: ghcr.io/pgmq/pg18-pgmq:v1.11.1
     container_name: pgmq-postgres
     environment:
       POSTGRES_USER: postgres
@@ -134,13 +134,15 @@ services:
     depends_on:
       nats:
         condition: service_healthy
-    environment:
-      NATS_URL: nats://nats:4222
-      NATS_MONITOR_URL: http://nats:8222
     ports:
       - "31311:31311" # NATS UI
+    volumes:
+      - nats_ui_data:/root/.config/nui # Persist connections
     networks:
       - pgmq-network
+    # Note: On first launch, manually add connection:
+    # URL: nats://nats:4222
+    # Name: Local NATS
 
   # PGMQ Relay Application
   pgmq-relay:
@@ -180,7 +182,7 @@ services:
 
   # Test Message Sender - continuously sends test messages to PGMQ queues
   test-message-sender:
-    image: ghcr.io/pgmq/pg18-pgmq:v1.9.0
+    image: ghcr.io/pgmq/pg18-pgmq:v1.11.1
     container_name: test-message-sender
     depends_on:
       postgres:
@@ -210,6 +212,8 @@ volumes:
   rabbitmq_data:
     driver: local
   nats_data:
+    driver: local
+  nats_ui_data:
     driver: local
 
 networks:

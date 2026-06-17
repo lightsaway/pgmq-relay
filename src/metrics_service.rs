@@ -14,14 +14,12 @@ pub struct Metrics {
     pub worker_operation_duration_seconds: HistogramVec,
     pub worker_operation_errors_total: CounterVec,
 
-    // Broker metrics (unchanged)
     pub broker_messages_sent_total: CounterVec,
     pub broker_messages_failed_total: CounterVec,
     pub broker_send_duration_seconds: HistogramVec,
     pub broker_health_check_status: GaugeVec,
     pub broker_batch_size: HistogramVec,
 
-    // System metrics (unchanged)
     pub relay_workers_active: Gauge,
 
     pub callback_failures_total: CounterVec,
@@ -300,8 +298,13 @@ pub struct OperationContext {
 #[derive(Debug, Clone)]
 pub enum SystemMetric {
     WorkerCount(i64),
-    UptimeTick,
+    /// Add this many seconds of uptime (the caller passes the real elapsed interval, so
+    /// the counter reports true seconds regardless of how often it is sampled).
+    UptimeSeconds(f64),
     Restart,
+    // Memory usage is only sampled on Linux (via /proc/self/status); on other platforms
+    // the variant is intentionally never constructed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     MemoryUsage(f64),
 }
 
@@ -360,8 +363,8 @@ impl MetricsService for PrometheusMetricsService {
                     }
                 }
             }
-            SystemMetric::UptimeTick => {
-                record_uptime_tick();
+            SystemMetric::UptimeSeconds(seconds) => {
+                record_uptime_seconds(seconds);
             }
             SystemMetric::Restart => {
                 record_restart();
@@ -513,9 +516,9 @@ pub fn record_completion_failure(
         .inc_by(message_count as f64);
 }
 
-pub fn record_uptime_tick() {
+pub fn record_uptime_seconds(seconds: f64) {
     let metrics = get_metrics();
-    metrics.relay_uptime_seconds.inc();
+    metrics.relay_uptime_seconds.inc_by(seconds);
 }
 
 pub fn record_restart() {
@@ -541,13 +544,22 @@ impl GlobalCircuitBreakerMetrics {
 }
 
 impl CircuitBreakerMetrics for GlobalCircuitBreakerMetrics {
-    fn record_success(&self, name: &str, duration: std::time::Duration, attempt: u32) {
+    fn record_state(&self, name: &str, state: f64) {
         let metrics = get_metrics();
-
         metrics
             .circuit_breaker_state
             .with_label_values(&[name, &self.operation_type])
-            .set(0.0);
+            .set(state);
+    }
+
+    fn record_success(&self, name: &str, duration: std::time::Duration, attempt: u32) {
+        let metrics = get_metrics();
+
+        // Success closes the breaker.
+        metrics
+            .circuit_breaker_state
+            .with_label_values(&[name, &self.operation_type])
+            .set(crate::circuit_breaker::CB_STATE_CLOSED);
 
         metrics
             .circuit_breaker_operations_total
@@ -603,7 +615,7 @@ impl CircuitBreakerMetrics for GlobalCircuitBreakerMetrics {
         metrics
             .circuit_breaker_state
             .with_label_values(&[name, &self.operation_type])
-            .set(1.0);
+            .set(crate::circuit_breaker::CB_STATE_OPEN);
 
         metrics
             .circuit_breaker_rejections_total

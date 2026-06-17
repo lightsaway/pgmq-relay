@@ -2,24 +2,16 @@ use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-mod broker;
-mod brokers;
-mod circuit_breaker;
-mod config;
-mod error;
-mod logging;
-mod metrics_server;
-mod metrics_service;
-mod pgmq_client;
-mod relay;
-mod transformer;
-mod validator;
-
-use config::Config;
-use metrics_service::{MetricsService, PrometheusMetricsService, SystemMetric};
-use relay::Relay;
+use pgmq_relay::config::Config;
+use pgmq_relay::error::RelayError;
+use pgmq_relay::health::HealthState;
+use pgmq_relay::metrics_server;
+use pgmq_relay::metrics_service::{MetricsService, PrometheusMetricsService, SystemMetric};
+use pgmq_relay::relay::Relay;
 
 #[derive(Parser)]
 #[command(name = "pgmq-relay")]
@@ -37,7 +29,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging based on environment
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "pgmq_relay=info".into());
@@ -63,7 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_file(&cli.config)?;
 
-    // If validate_config flag is set, validate and exit
     if cli.validate_config {
         info!("✅ Configuration validation successful!");
         info!("📄 Config file: {}", cli.config);
@@ -71,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("🔗 Brokers configured: {}", config.brokers.len());
         info!("📊 Metrics enabled: {}", config.metrics.enabled);
 
-        // Additional validation with suggestions
         match config.validate_with_suggestions() {
             Ok(()) => {
                 info!("🎉 All configuration checks passed!");
@@ -89,37 +78,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_service: Arc<dyn MetricsService> = Arc::new(PrometheusMetricsService::new()?);
     info!("Metrics initialized");
 
-    // Record startup
     metrics_service.record_system_metric(SystemMetric::Restart);
 
-    let mut relay = Relay::new(config.clone(), Arc::clone(&metrics_service)).await?;
+    // Shared health state backing the /health and /ready probes.
+    let health = HealthState::new();
+
+    let mut relay =
+        Relay::new(config.clone(), Arc::clone(&metrics_service), health.clone()).await?;
+
+    let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+    let (task_failure_tx, mut task_failure_rx) = mpsc::unbounded_channel::<String>();
+    let mut app_task_handles: Vec<JoinHandle<()>> = Vec::new();
 
     if config.metrics.enabled {
         let metrics_addr = format!("{}:{}", config.metrics.bind_address, config.metrics.port)
             .parse()
             .map_err(|e| format!("Invalid metrics bind address: {}", e))?;
 
-        tokio::spawn(async move {
+        let metrics_health = health.clone();
+        let mut metrics_shutdown_rx = app_shutdown_rx.clone();
+        let metrics_failure_tx = task_failure_tx.clone();
+        let metrics_handle = tokio::spawn(async move {
             info!("Starting metrics server on {}", metrics_addr);
-            if let Err(e) = metrics_server::start_metrics_server(metrics_addr).await {
-                error!("Metrics server failed: {}", e);
+            let shutdown = async move {
+                let _ = metrics_shutdown_rx.changed().await;
+            };
+            if let Err(e) = metrics_server::start_metrics_server_with_shutdown(
+                metrics_addr,
+                metrics_health,
+                shutdown,
+            )
+            .await
+            {
+                let message = format!("Metrics server failed: {}", e);
+                error!("{}", message);
+                let _ = metrics_failure_tx.send(message);
             }
         });
+        app_task_handles.push(metrics_handle);
     }
 
     relay.start().await?;
 
-    // Start background task for system metrics
     let metrics_service_bg = Arc::clone(&metrics_service);
-    tokio::spawn(async move {
+    let mut uptime_shutdown_rx = app_shutdown_rx.clone();
+    let uptime_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut last_tick = tokio::time::Instant::now();
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = uptime_shutdown_rx.changed() => break,
+                _ = interval.tick() => {}
+            }
 
-            // Record uptime tick (every 10 seconds)
-            metrics_service_bg.record_system_metric(SystemMetric::UptimeTick);
+            // Record the real elapsed time so the uptime counter reports true seconds
+            // (not one increment per tick) and stays correct if the interval changes.
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(last_tick).as_secs_f64();
+            last_tick = now;
+            metrics_service_bg.record_system_metric(SystemMetric::UptimeSeconds(elapsed));
 
-            // Update memory usage if possible
             #[cfg(target_os = "linux")]
             if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
                 for line in status.lines() {
@@ -128,7 +146,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(kb) = kb_str.parse::<f64>() {
                                 metrics_service_bg
                                     .record_system_metric(SystemMetric::MemoryUsage(kb * 1024.0));
-                                // Convert KB to bytes
                             }
                         }
                         break;
@@ -136,18 +153,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // For non-Linux systems, we can't easily get memory usage
-            // so we'll set a placeholder value or use system-specific methods
+            // On non-Linux systems we don't have a cheap RSS source, so we simply do not
+            // emit the memory gauge rather than reporting a misleading 0 bytes.
             #[cfg(not(target_os = "linux"))]
             {
-                // Use 0 as placeholder - in production you might want to use
-                // platform-specific memory APIs
-                metrics_service_bg.record_system_metric(SystemMetric::MemoryUsage(0.0));
+                let _ = &metrics_service_bg;
             }
         }
     });
+    app_task_handles.push(uptime_handle);
 
     info!("PGMQ Relay is running. Press Ctrl+C to stop.");
+
+    let mut fatal_error: Option<RelayError> = None;
 
     tokio::select! {
         _ = signal::ctrl_c() => {
@@ -156,14 +174,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = relay.wait_for_shutdown() => {
             if let Err(e) = result {
                 error!("Relay error: {}", e);
-                return Err(e.into());
+                fatal_error = Some(e);
+            }
+        }
+        failure = task_failure_rx.recv() => {
+            if let Some(failure) = failure {
+                error!("Background task failed: {}", failure);
+                fatal_error = Some(RelayError::Configuration(failure));
             }
         }
     }
 
     let shutdown_timeout = Duration::from_secs(cli.shutdown_timeout);
+    let _ = app_shutdown_tx.send(true);
     relay.shutdown(shutdown_timeout).await?;
+    shutdown_app_tasks(&mut app_task_handles, shutdown_timeout).await?;
+
+    if let Some(error) = fatal_error {
+        return Err(error.into());
+    }
 
     info!("PGMQ Relay stopped");
+    Ok(())
+}
+
+async fn shutdown_app_tasks(
+    handles: &mut Vec<JoinHandle<()>>,
+    timeout: Duration,
+) -> Result<(), RelayError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while let Some(mut handle) = handles.pop() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            handle.abort();
+            for handle in handles.iter() {
+                handle.abort();
+            }
+            return Err(RelayError::ShutdownTimeout);
+        }
+
+        tokio::select! {
+            result = &mut handle => {
+                result?;
+            }
+            _ = tokio::time::sleep(remaining) => {
+                handle.abort();
+                let _ = handle.await;
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+                return Err(RelayError::ShutdownTimeout);
+            }
+        }
+    }
+
     Ok(())
 }

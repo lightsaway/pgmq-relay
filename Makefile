@@ -1,7 +1,7 @@
 # pgmq-relay Makefile
 # Provides build, test, and Docker operations for the pgmq-relay project
 
-.PHONY: help build test clean docker-build docker-run docker-stop docker-compose-up docker-compose-down docker-logs fmt clippy check install dev prod
+.PHONY: help build test clean docker-build docker-run docker-stop docker-compose-up docker-compose-down docker-logs fmt clippy check install dev prod site site-serve
 
 # Default target
 help: ## Show this help message
@@ -179,6 +179,12 @@ docs: ## Generate and open documentation
 
 docs-build: ## Build documentation without opening
 	cargo doc --no-deps
+
+site: ## Build the GitHub Pages static site with mdBook
+	mdbook build
+
+site-serve: ## Serve the mdBook site locally
+	mdbook serve --open
 
 # Version management
 version: ## Show current version
