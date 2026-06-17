@@ -491,6 +491,13 @@ impl MessageBroker for KafkaBroker {
                     }
 
                     if !failed_message_ids.is_empty() {
+                        if !self.supports_transactions {
+                            return Ok(SendResult {
+                                successful_message_ids,
+                                failed_messages,
+                            });
+                        }
+
                         return Err(RelayError::BrokerSend(format!(
                             "Failed to send {} out of {} messages to topic '{}'",
                             failed_message_ids.len(),

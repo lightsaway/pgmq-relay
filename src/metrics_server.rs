@@ -6,12 +6,14 @@ use axum::{
     Router,
 };
 use prometheus::{Encoder, TextEncoder};
+use std::future::Future;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
+use crate::error::RelayError;
 use crate::health::HealthState;
 use crate::metrics_service;
 
@@ -23,13 +25,27 @@ pub struct MetricsState {
 pub async fn start_metrics_server(
     bind_addr: SocketAddr,
     health: HealthState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RelayError> {
+    start_metrics_server_with_shutdown(bind_addr, health, std::future::pending::<()>()).await
+}
+
+pub async fn start_metrics_server_with_shutdown<F>(
+    bind_addr: SocketAddr,
+    health: HealthState,
+    shutdown: F,
+) -> Result<(), RelayError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let app = create_metrics_app(health);
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Metrics server listening on http://{}", bind_addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|e| RelayError::Configuration(format!("Metrics server failed: {}", e)))?;
     Ok(())
 }
 
@@ -38,45 +54,41 @@ fn create_metrics_app(health: HealthState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
-        .layer(
-            ServiceBuilder::new()
-                .layer(CorsLayer::permissive())
-        )
+        .layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
         .with_state(MetricsState { health })
 }
 
 async fn metrics_handler(State(_state): State<MetricsState>) -> Response {
     let registry = metrics_service::Metrics::registry();
     let metric_families = registry.gather();
-    
+
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
-    
+
     match encoder.encode(&metric_families, &mut buffer) {
-        Ok(()) => {
-            match String::from_utf8(buffer) {
-                Ok(metrics_output) => {
-                    (
-                        StatusCode::OK,
-                        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-                        metrics_output,
-                    ).into_response()
-                }
-                Err(e) => {
-                    error!("Failed to convert metrics to UTF-8: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to encode metrics as UTF-8",
-                    ).into_response()
-                }
+        Ok(()) => match String::from_utf8(buffer) {
+            Ok(metrics_output) => (
+                StatusCode::OK,
+                [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+                metrics_output,
+            )
+                .into_response(),
+            Err(e) => {
+                error!("Failed to convert metrics to UTF-8: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to encode metrics as UTF-8",
+                )
+                    .into_response()
             }
-        }
+        },
         Err(e) => {
             error!("Failed to encode metrics: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to encode metrics",
-            ).into_response()
+            )
+                .into_response()
         }
     }
 }
@@ -175,7 +187,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        
+
         let content_type = response.headers().get("content-type").unwrap();
         assert!(content_type.to_str().unwrap().contains("text/plain"));
     }

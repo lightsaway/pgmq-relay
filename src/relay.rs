@@ -1,6 +1,8 @@
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -19,8 +21,16 @@ pub struct Relay {
     pgmq_client: Arc<dyn PgmqClient>,
     shutdown_tx: Option<watch::Sender<bool>>,
     worker_handles: Vec<JoinHandle<()>>,
+    worker_exit_tx: mpsc::UnboundedSender<WorkerExit>,
+    worker_exit_rx: mpsc::UnboundedReceiver<WorkerExit>,
+    background_handles: Vec<JoinHandle<()>>,
     metrics_service: Arc<dyn MetricsService>,
     health: HealthState,
+}
+
+struct WorkerExit {
+    name: String,
+    result: Result<(), RelayError>,
 }
 
 impl Relay {
@@ -45,11 +55,16 @@ impl Relay {
 
         info!("All broker configurations validated");
 
+        let (worker_exit_tx, worker_exit_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             config,
             pgmq_client,
             shutdown_tx: None,
             worker_handles: Vec::new(),
+            worker_exit_tx,
+            worker_exit_rx,
+            background_handles: Vec::new(),
             metrics_service,
             health,
         })
@@ -96,8 +111,12 @@ impl Relay {
                 worker_config.name
             );
             let worker_broker: Arc<dyn MessageBroker> = Arc::from(
-                create_broker(&worker_config.broker_name, broker_config, &worker_config.name)
-                    .await?,
+                create_broker(
+                    &worker_config.broker_name,
+                    broker_config,
+                    &worker_config.name,
+                )
+                .await?,
             );
 
             let health_check_result = worker_broker.health_check().await;
@@ -139,16 +158,38 @@ impl Relay {
                 metrics_service: Arc::clone(&self.metrics_service),
             };
 
+            let worker_exit_tx = self.worker_exit_tx.clone();
             let handle = tokio::spawn(async move {
+                let worker_name = worker.worker_config.name.clone();
                 worker
                     .metrics_service
                     .record_system_metric(SystemMetric::WorkerCount(1));
-                if let Err(e) = worker.run().await {
-                    error!("Worker '{}' failed: {}", worker.worker_config.name, e);
+                let result = match AssertUnwindSafe(worker.run()).catch_unwind().await {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let panic_message = if let Some(message) = payload.downcast_ref::<&str>() {
+                            (*message).to_string()
+                        } else if let Some(message) = payload.downcast_ref::<String>() {
+                            message.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        Err(RelayError::Configuration(format!(
+                            "worker panicked: {}",
+                            panic_message
+                        )))
+                    }
+                };
+                if let Err(e) = &result {
+                    error!("Worker '{}' failed: {}", worker_name, e);
                 }
                 worker
                     .metrics_service
                     .record_system_metric(SystemMetric::WorkerCount(-1));
+                let _ = worker_exit_tx.send(WorkerExit {
+                    name: worker_name,
+                    result,
+                });
             });
 
             self.worker_handles.push(handle);
@@ -183,7 +224,7 @@ impl Relay {
         let health = self.health.clone();
         let pgmq_client = Arc::clone(&self.pgmq_client);
         let mut readiness_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        let readiness_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tokio::select! {
@@ -194,12 +235,13 @@ impl Relay {
                 }
             }
         });
+        self.background_handles.push(readiness_handle);
 
         // Periodically re-check each broker's health so `broker_health_check_status`
         // tracks live state and alerts on a broker going down actually fire.
         if !monitored_brokers.is_empty() {
             let mut broker_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            let broker_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(15));
                 loop {
                     tokio::select! {
@@ -213,6 +255,7 @@ impl Relay {
                     }
                 }
             });
+            self.background_handles.push(broker_handle);
         }
 
         Ok(())
@@ -225,35 +268,68 @@ impl Relay {
             let _ = shutdown_tx.send(true);
         }
 
-        let shutdown_future = async {
-            for handle in self.worker_handles.drain(..) {
-                if let Err(e) = handle.await {
-                    warn!("Worker shutdown error: {}", e);
-                }
-            }
-        };
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        tokio::select! {
-            _ = shutdown_future => {
-                info!("All workers shut down successfully");
-                Ok(())
-            }
-            _ = tokio::time::sleep(timeout) => {
-                warn!("Shutdown timeout reached, aborting remaining workers");
-                for handle in &self.worker_handles {
-                    handle.abort();
-                }
-                Err(RelayError::ShutdownTimeout)
-            }
-        }
+        join_task_handles(&mut self.worker_handles, deadline, "Worker").await?;
+        join_task_handles(&mut self.background_handles, deadline, "Background task").await?;
+
+        info!("All workers shut down successfully");
+        Ok(())
     }
 
     pub async fn wait_for_shutdown(&mut self) -> Result<(), RelayError> {
-        for handle in self.worker_handles.drain(..) {
-            handle.await?;
+        match self.worker_exit_rx.recv().await {
+            Some(exit) => match exit.result {
+                Ok(()) => Err(RelayError::Configuration(format!(
+                    "Worker '{}' exited unexpectedly",
+                    exit.name
+                ))),
+                Err(e) => Err(RelayError::Configuration(format!(
+                    "Worker '{}' failed: {}",
+                    exit.name, e
+                ))),
+            },
+            None => Err(RelayError::Configuration(
+                "Worker supervisor channel closed".to_string(),
+            )),
         }
-        Ok(())
     }
+}
+
+async fn join_task_handles(
+    handles: &mut Vec<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+    task_kind: &str,
+) -> Result<(), RelayError> {
+    while let Some(mut handle) = handles.pop() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            handle.abort();
+            for handle in handles.iter() {
+                handle.abort();
+            }
+            return Err(RelayError::ShutdownTimeout);
+        }
+
+        tokio::select! {
+            result = &mut handle => {
+                if let Err(e) = result {
+                    warn!("{} shutdown error: {}", task_kind, e);
+                }
+            }
+            _ = tokio::time::sleep(remaining) => {
+                warn!("Shutdown timeout reached, aborting remaining {} tasks", task_kind);
+                handle.abort();
+                let _ = handle.await;
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+                return Err(RelayError::ShutdownTimeout);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct RelayWorker {
