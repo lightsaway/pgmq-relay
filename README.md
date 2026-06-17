@@ -7,7 +7,7 @@ A Rust-based message relay service that reads from PGMQ (Postgres Message Queue)
 - **Multi-Queue Workers**: Each worker polls a single queue; configurable parallelism runs multiple workers per queue concurrently
 - **At-Least-Once Delivery**: Messages are only deleted/archived from PGMQ *after* the broker confirms receipt (publisher confirms on RabbitMQ, server flush on core NATS, JetStream/Kafka acks). On a crash between broker-ack and PGMQ-delete, messages are redelivered — **downstream consumers must be idempotent / deduplicate.** See [Delivery Semantics](#delivery-semantics).
 - **Poison-Message Handling**: A message that fails transformation no longer blocks its queue; with a `dead_letter_queue` configured it is routed there, otherwise it is retried after the visibility timeout while the rest of the batch proceeds
-- **Multiple Fetch Modes**: Support for all PGMQ 1.9.0 read methods (regular, long-polling, FIFO grouped, round-robin)
+- **Multiple Fetch Modes**: Support for PGMQ 1.11.1 read methods used by the relay (regular, long-polling, FIFO grouped, grouped-head, round-robin, pop)
 - **FIFO Support**: Proper FIFO queue polling with configurable batch sizes
 - **Multiple Brokers**: Abstracted broker interface supporting Kafka, RabbitMQ, and NATS
 - **Message Transformation**: Support for passthrough, JSON field extraction, and custom templates
@@ -86,7 +86,7 @@ The fastest way to try out pgmq-relay is using the included Docker Compose setup
 
 The `docker-compose.yml` provides a full-stack example environment:
 
-- **PostgreSQL with PGMQ 1.9.0** - Message queue database
+- **PostgreSQL with PGMQ 1.11.1** - Message queue database
 - **Redpanda** - Kafka-compatible broker with web console
 - **RabbitMQ** - AMQP broker with management UI
 - **NATS** - Lightweight pub/sub broker with JetStream
@@ -216,7 +216,7 @@ Each queue spawns `parallelism` workers, each with its own broker connection.
 |-----|------|---------|---------------|
 | `queue_name` | string | *(required)* | Alphanumeric, `_`, `-` only. The PGMQ queue to consume. |
 | `destination_topic` | string | `queue_name` | Kafka topic / NATS subject / RabbitMQ routing key. |
-| `fetch_mode` | enum | `"regular"` | See [Fetch Modes](#pgmq-fetch-modes-pgmq-190). |
+| `fetch_mode` | enum | `"regular"` | See [Fetch Modes](#pgmq-fetch-modes-pgmq-1111). |
 | `key_field` | string | `"message_id"` | Field (header first, then body, dot-path for nesting) used as the broker key. Falls back to the PGMQ message id. |
 | `parallelism` | int | `1` | ≥ 1. Concurrent workers for this queue. Use `1` for strict ordering. Env: `PGMQ_RELAY_DEFAULT_PARALLELISM`. |
 | `batch_size` | int | `10` | 1–1000. Messages read per poll. Env: `PGMQ_RELAY_DEFAULT_BATCH_SIZE`. |
@@ -330,7 +330,7 @@ PGMQ completion (delete/archive) is wrapped in a circuit breaker with exponentia
 
 When the breaker is open the relay stops sending to the broker (and `/ready` reports not-ready) to avoid deleting messages it cannot confirm.
 
-### PGMQ Fetch Modes (PGMQ 1.9.0+)
+### PGMQ Fetch Modes (PGMQ 1.11.1)
 
 The relay supports all PGMQ read methods for different use cases:
 
@@ -362,6 +362,13 @@ The relay supports all PGMQ read methods for different use cases:
 - **`read_grouped_rr_with_poll`**: Round-robin FIFO with long-polling
   - Combines round-robin grouped reading with polling wait
   - Optimal for multi-tenant scenarios with ordering requirements
+
+- **`read_grouped_head`**: FIFO grouped-head reading
+  - Reads at most one visible head message per FIFO group
+  - Useful when you want broad group concurrency without draining one group into a batch
+
+- **`read_grouped_head_with_poll`**: FIFO grouped-head reading with long-polling
+  - Combines grouped-head behavior with polling wait
 
 - **`pop`**: At-most-once delivery with `pgmq.pop()`
   - ⚠️ **WARNING**: Messages deleted immediately upon read

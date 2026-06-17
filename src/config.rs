@@ -2,6 +2,7 @@ use humantime_serde::re::humantime;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::validator::Validator;
 
@@ -218,6 +219,15 @@ pub enum FetchMode {
     /// Combines round-robin grouped reading with polling wait
     #[serde(rename = "read_grouped_rr_with_poll")]
     ReadGroupedRoundRobinWithPoll,
+
+    /// Read one visible head message from each FIFO group using pgmq.read_grouped_head()
+    /// Returns up to qty groups/messages, preserving per-group head-of-line ordering.
+    #[serde(rename = "read_grouped_head")]
+    ReadGroupedHead,
+
+    /// Read one visible head message from each FIFO group with long-polling.
+    #[serde(rename = "read_grouped_head_with_poll")]
+    ReadGroupedHeadWithPoll,
 
     /// Pop messages using pgmq.pop() - reads and deletes in one operation
     /// WARNING: At-most-once delivery semantics - messages deleted immediately
@@ -616,9 +626,17 @@ impl Config {
         }
 
         match queue.fetch_mode {
+            FetchMode::Pop => {
+                warn!(
+                    queue_name = %queue.queue_name,
+                    "Queue '{}' uses pop fetch mode; PGMQ removes messages before broker delivery, so messages can be lost if transformation, broker delivery, or the relay process fails",
+                    queue.queue_name
+                );
+            }
             FetchMode::ReadWithPoll
             | FetchMode::ReadGroupedWithPoll
-            | FetchMode::ReadGroupedRoundRobinWithPoll => {
+            | FetchMode::ReadGroupedRoundRobinWithPoll
+            | FetchMode::ReadGroupedHeadWithPoll => {
                 if queue.max_poll_seconds <= 0 || queue.max_poll_seconds > 60 {
                     return Err(ConfigValidationError::InvalidBrokerConfig {
                         broker_name: "queue_config".to_string(),
@@ -652,6 +670,8 @@ impl Config {
                 | FetchMode::ReadGroupedWithPoll
                 | FetchMode::ReadGroupedRoundRobin
                 | FetchMode::ReadGroupedRoundRobinWithPoll
+                | FetchMode::ReadGroupedHead
+                | FetchMode::ReadGroupedHeadWithPoll
         );
         if is_grouped && queue.parallelism > 1 {
             tracing::warn!(

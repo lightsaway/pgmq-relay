@@ -1,7 +1,7 @@
 services:
   # PostgreSQL with PGMQ extension
   postgres:
-    image: ghcr.io/pgmq/pg18-pgmq:v1.9.0
+    image: ghcr.io/pgmq/pg18-pgmq:v1.11.1
     container_name: pgmq-postgres
     environment:
       POSTGRES_USER: postgres
@@ -182,7 +182,7 @@ services:
 
   # Test Message Sender - continuously sends test messages to PGMQ queues
   test-message-sender:
-    image: ghcr.io/pgmq/pg18-pgmq:v1.9.0
+    image: ghcr.io/pgmq/pg18-pgmq:v1.11.1
     container_name: test-message-sender
     depends_on:
       postgres:

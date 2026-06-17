@@ -147,6 +147,18 @@ impl PgmqClientImpl {
                      FROM pgmq.read_grouped_rr_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
                 )
             }
+            FetchMode::ReadGroupedHead => {
+                format!(
+                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                     FROM pgmq.read_grouped_head($1::text, $2::integer, $3::integer)"
+                )
+            }
+            FetchMode::ReadGroupedHeadWithPoll => {
+                format!(
+                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                     FROM pgmq.read_grouped_head_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
+                )
+            }
             FetchMode::Pop => {
                 // Note: pop() doesn't use visibility timeout
                 format!(
@@ -159,15 +171,17 @@ impl PgmqClientImpl {
         let mut query_builder = sqlx::query(&query).bind(queue_name);
 
         match queue_config.fetch_mode {
-            FetchMode::Regular | FetchMode::ReadGrouped | FetchMode::ReadGroupedRoundRobin => {
+            FetchMode::Regular
+            | FetchMode::ReadGrouped
+            | FetchMode::ReadGroupedRoundRobin
+            | FetchMode::ReadGroupedHead => {
                 // These modes use: queue_name, vt, qty
-                query_builder = query_builder
-                    .bind(visibility_timeout)
-                    .bind(batch_size);
+                query_builder = query_builder.bind(visibility_timeout).bind(batch_size);
             }
             FetchMode::ReadWithPoll
             | FetchMode::ReadGroupedWithPoll
-            | FetchMode::ReadGroupedRoundRobinWithPoll => {
+            | FetchMode::ReadGroupedRoundRobinWithPoll
+            | FetchMode::ReadGroupedHeadWithPoll => {
                 // These modes use: queue_name, vt, qty, max_poll_seconds, poll_interval_ms
                 query_builder = query_builder
                     .bind(visibility_timeout)
@@ -181,15 +195,12 @@ impl PgmqClientImpl {
             }
         }
 
-        let rows = query_builder
-            .fetch_all(&*self.pool)
-            .await
-            .map_err(|e| {
-                RelayError::PgmqOperation(format!(
-                    "Failed to read messages using {:?}: {}",
-                    queue_config.fetch_mode, e
-                ))
-            })?;
+        let rows = query_builder.fetch_all(&*self.pool).await.map_err(|e| {
+            RelayError::PgmqOperation(format!(
+                "Failed to read messages using {:?}: {}",
+                queue_config.fetch_mode, e
+            ))
+        })?;
 
         let mut messages = Vec::new();
         for row in rows {
@@ -382,7 +393,10 @@ impl PgmqClient for PgmqClientImpl {
             Value::String(error.to_string()),
         );
         if let Some(original) = &message.headers {
-            dlq_headers.insert("x-dead-letter-original-headers".to_string(), original.clone());
+            dlq_headers.insert(
+                "x-dead-letter-original-headers".to_string(),
+                original.clone(),
+            );
         }
         let headers_value = Value::Object(dlq_headers);
 
