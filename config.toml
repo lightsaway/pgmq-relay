@@ -1,0 +1,119 @@
+# =============================================================================
+# pgmq-relay configuration (complete, commented example)
+#
+# Structure:
+#   [pgmq]            - database connection
+#   [metrics]         - Prometheus / health endpoints
+#   default_broker    - broker used by queues without their own broker_name
+#   [brokers.<name>]  - one or more broker definitions (kafka | rabbitmq | nats)
+#   [[queues]]        - one or more queues; each spawns `parallelism` workers
+#
+# There is NO [relay] or [[workers]] section: workers are derived from queues.
+# Validate without starting: `pgmq-relay --config config.toml --validate-config`
+# =============================================================================
+
+# Top-level keys must appear before the first [table] header.
+# Broker used by queues that don't set their own `broker_name`.
+default_broker = "my_kafka"
+
+# --- Database ----------------------------------------------------------------
+[pgmq]
+# Must start with postgres:// or postgresql://
+connection_url = "postgres://postgres:postgres@localhost:5432/postgres"
+# Connection-pool size (1-100). Env: PGMQ_RELAY_DEFAULT_MAX_CONNECTIONS
+max_connections = 10
+
+# --- Observability -----------------------------------------------------------
+[metrics]
+enabled = true            # serves /metrics, /health (liveness), /ready (readiness)
+bind_address = "0.0.0.0"
+port = 9090               # must be >= 1024
+
+# =============================================================================
+# Brokers — define at least one. Select the implementation with `type`.
+# =============================================================================
+
+# --- Kafka -------------------------------------------------------------------
+[brokers.my_kafka]
+type = "kafka"
+bootstrap_servers = "localhost:9092"   # env: PGMQ_RELAY_KAFKA_BOOTSTRAP_SERVERS
+# security_protocol = "SASL_SSL"        # env: PGMQ_RELAY_KAFKA_SECURITY_PROTOCOL
+# sasl_mechanism   = "PLAIN"            # env: PGMQ_RELAY_KAFKA_SASL_MECHANISM
+# sasl_username    = "user"             # env: PGMQ_RELAY_KAFKA_SASL_USERNAME
+# sasl_password    = "pass"             # env: PGMQ_RELAY_KAFKA_SASL_PASSWORD
+# ssl_ca_location  = "/certs/ca.pem"    # env: PGMQ_RELAY_KAFKA_SSL_CA_LOCATION
+# Any other key is forwarded verbatim to librdkafka, e.g.:
+# "compression.type" = "zstd"
+
+# Transactions are ON by default. Set `transactions = false` (instead of this
+# table) for plain at-least-once producing at higher throughput.
+[brokers.my_kafka.transactions]
+# transactional.id strategy: hostname (default) | static | random
+strategy = { type = "hostname", prefix = "pgmq-relay" }
+timeout_ms = 60000        # 1000-300000
+retries = 3
+
+# --- RabbitMQ (uncomment to use) ---------------------------------------------
+# [brokers.my_rabbit]
+# type = "rabbitmq"
+# url = "amqp://guest:guest@localhost:5672/%2f"  # env: PGMQ_RELAY_RABBITMQ_URL
+# exchange = "pgmq.relay"      # "" uses the default exchange
+# exchange_type = "topic"      # direct | topic | fanout | headers
+# declare_exchange = true
+# durable = true
+# auto_delete = false
+# delivery_mode = 2            # 1 = transient, 2 = persistent
+# pool_size = 5                # publish channels per worker
+
+# --- NATS (uncomment to use) -------------------------------------------------
+# [brokers.my_nats]
+# type = "nats"
+# url = "nats://localhost:4222"   # env: PGMQ_RELAY_NATS_URL (comma-separated cluster)
+# client_name = "pgmq-relay"
+# max_reconnects = 60
+# reconnect_delay_ms = 5000
+# jetstream_enabled = false       # true = wait for per-message stream acks
+# use_key_as_subject_suffix = false  # true publishes to "<subject>.<key>"
+
+# =============================================================================
+# Queues — each [[queues]] becomes `parallelism` workers.
+# =============================================================================
+
+# A simple high-throughput queue, keyed by message id, deleted on success.
+[[queues]]
+queue_name = "user_events"
+destination_topic = "events.users"
+fetch_mode = "regular"
+key_field = "user_id"
+parallelism = 3
+batch_size = 100
+poll_interval = "250ms"
+visibility_timeout_seconds = 30
+archive_messages = false
+
+# An ordered (FIFO) queue. Use parallelism = 1 to preserve strict ordering.
+# A dead-letter queue catches messages that fail transformation.
+[[queues]]
+queue_name = "orders"
+destination_topic = "events.orders"
+fetch_mode = "read_grouped"
+key_field = "x-pgmq-group"
+parallelism = 1
+batch_size = 50
+poll_interval = "500ms"
+visibility_timeout_seconds = 60
+archive_messages = true
+dead_letter_queue = "orders_dlq"
+
+# Extract a single JSON field from the message body before sending.
+[[queues]]
+queue_name = "analytics"
+destination_topic = "events.analytics"
+fetch_mode = "read_with_poll"
+max_poll_seconds = 5
+poll_interval_ms = 100
+batch_size = 200
+
+[queues.message_transformation]
+type = "json_extract"     # passthrough | json_extract | custom_template
+field = "payload"

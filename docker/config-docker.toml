@@ -7,12 +7,6 @@ default_broker = "redpanda"
 connection_url = "postgres://postgres:postgres@postgres:5432/pgmq_relay"
 max_connections = 10
 
-[relay]
-poll_interval = "1s"
-poll_timeout = "5s"
-batch_size = 10
-visibility_timeout_seconds = 30
-
 [metrics]
 enabled = true
 bind_address = "0.0.0.0"
