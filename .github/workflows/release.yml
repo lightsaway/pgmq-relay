@@ -59,7 +59,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config perl libsasl2-dev
+            build-essential cmake pkg-config perl libsasl2-dev \
+            libcurl4-openssl-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
