@@ -1,5 +1,7 @@
+# syntax=docker/dockerfile:1.7
+
 # Build stage - use Alpine for minimal image size
-FROM rust:1.87-alpine AS builder
+FROM rust:1.88-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -11,18 +13,36 @@ RUN apk add --no-cache \
     g++ \
     openssl-dev \
     openssl-libs-static \
+    curl-dev \
     cyrus-sasl-dev \
     perl \
     linux-headers
 
 # Create app directory
 WORKDIR /usr/src/pgmq-relay
-COPY . .
+
+# Target musl and link OpenSSL statically in both cached build passes.
+ENV OPENSSL_STATIC=1
+
+# Build dependencies first so source-only changes reuse the expensive dependency layer.
+COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/pgmq-relay/target \
+    mkdir src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && printf '' > src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+
+COPY src ./src
 
 # Build the application with release optimizations
-# Target musl for static linking
-ENV OPENSSL_STATIC=1
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/pgmq-relay/target \
+    cargo build --release --locked \
+    && cp target/release/pgmq-relay /tmp/pgmq-relay
 
 # Create a new stage with a minimal image
 FROM alpine:3.21
@@ -34,7 +54,7 @@ RUN apk add --no-cache \
     libgcc
 
 # Copy the build artifact from the builder stage
-COPY --from=builder /usr/src/pgmq-relay/target/release/pgmq-relay /usr/local/bin/pgmq-relay
+COPY --from=builder /tmp/pgmq-relay /usr/local/bin/pgmq-relay
 
 # Verify the binary was copied and make it executable
 RUN chmod +x /usr/local/bin/pgmq-relay

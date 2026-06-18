@@ -1,5 +1,7 @@
 target/
+book/
 .git/
+.github/
 .gitignore
 *.md
 !docker/*.md
