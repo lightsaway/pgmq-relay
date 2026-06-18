@@ -112,63 +112,45 @@ impl PgmqClientImpl {
 
         let query = match queue_config.fetch_mode {
             FetchMode::Regular => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read($1::text, $2::integer, $3::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read($1::text, $2::integer, $3::integer)"
             }
             FetchMode::ReadWithPoll => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
             }
             FetchMode::ReadGrouped => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_grouped($1::text, $2::integer, $3::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_grouped($1::text, $2::integer, $3::integer)"
             }
             FetchMode::ReadGroupedWithPoll => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_grouped_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_grouped_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
             }
             FetchMode::ReadGroupedRoundRobin => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_grouped_rr($1::text, $2::integer, $3::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_grouped_rr($1::text, $2::integer, $3::integer)"
             }
             FetchMode::ReadGroupedRoundRobinWithPoll => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_grouped_rr_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_grouped_rr_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
             }
             FetchMode::ReadGroupedHead => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_grouped_head($1::text, $2::integer, $3::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_grouped_head($1::text, $2::integer, $3::integer)"
             }
             FetchMode::ReadGroupedHeadWithPoll => {
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.read_grouped_head_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.read_grouped_head_with_poll($1::text, $2::integer, $3::integer, $4::integer, $5::integer)"
             }
+            // pop() doesn't use visibility timeout.
             FetchMode::Pop => {
-                // Note: pop() doesn't use visibility timeout
-                format!(
-                    "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
-                     FROM pgmq.pop($1::text, $2::integer)"
-                )
+                "SELECT msg_id, read_ct, enqueued_at, vt, message, headers \
+                 FROM pgmq.pop($1::text, $2::integer)"
             }
         };
 
-        let mut query_builder = sqlx::query(&query).bind(queue_name);
+        let mut query_builder = sqlx::query(query).bind(queue_name);
 
         match queue_config.fetch_mode {
             FetchMode::Regular

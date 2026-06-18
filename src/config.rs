@@ -309,8 +309,7 @@ impl QueueConfig {
     /// If destination_topic is not configured, uses queue_name as fallback
     pub fn effective_destination_topic(&self) -> &str {
         self.destination_topic
-            .as_ref()
-            .map(|s| s.as_str())
+            .as_deref()
             .unwrap_or(&self.queue_name)
     }
 
@@ -318,10 +317,9 @@ impl QueueConfig {
     /// Precedence: queue.broker_name > config.default_broker > config.broker_name
     pub fn effective_broker_name<'a>(&'a self, config: &'a Config) -> Option<&'a str> {
         self.broker_name
-            .as_ref()
-            .map(|s| s.as_str())
-            .or_else(|| config.default_broker.as_ref().map(|s| s.as_str()))
-            .or_else(|| config.broker_name.as_ref().map(|s| s.as_str()))
+            .as_deref()
+            .or(config.default_broker.as_deref())
+            .or(config.broker_name.as_deref())
     }
 }
 
@@ -392,21 +390,16 @@ where
     Ok(timeout)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum MessageTransformation {
     #[serde(rename = "passthrough")]
+    #[default]
     Passthrough,
     #[serde(rename = "json_extract")]
     JsonExtract { field: String },
     #[serde(rename = "custom_template")]
     CustomTemplate { template: String },
-}
-
-impl Default for MessageTransformation {
-    fn default() -> Self {
-        MessageTransformation::Passthrough
-    }
 }
 
 fn default_parallelism() -> usize {

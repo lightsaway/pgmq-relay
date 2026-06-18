@@ -6,7 +6,7 @@ authors = ["PGMQ Relay Maintainers"]
 description = "A message relay service that forwards PGMQ messages to various message brokers"
 keywords = ["messaging", "queues", "postgres", "relay", "kafka"]
 license = "PostgreSQL"
-repository = "https://github.com/pgmq/pgmq"
+repository = "https://github.com/lightsaway/pgmq-relay"
 
 [lib]
 name = "pgmq_relay"
@@ -34,7 +34,7 @@ humantime-serde = "1.1"
 # Message broker integrations
 rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored"] }
 lapin = "2.3"
-async-nats = "0.33"
+async-nats = "0.49"
 
 # Error handling and logging
 thiserror = "1.0"
@@ -60,7 +60,7 @@ failsafe = "1.0"
 backoff = "0.4"
 
 # Metrics and monitoring
-prometheus = "0.13"
+prometheus = "0.14"
 axum = "0.7"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors"] }

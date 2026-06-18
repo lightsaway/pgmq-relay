@@ -1,5 +1,5 @@
-use pgmq_relay::transformer::MessageTransformer;
 use pgmq_relay::config::MessageTransformation;
+use pgmq_relay::transformer::MessageTransformer;
 use serde_json::{json, Value};
 use std::sync::Once;
 
@@ -25,7 +25,8 @@ fn test_passthrough_transformation() {
         "test_queue",
         "user_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.id, 1);
     assert_eq!(result.key, Some("123".to_string()));
@@ -55,14 +56,18 @@ fn test_json_extract_transformation() {
         "test_queue",
         "user_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.id, 2);
     assert_eq!(result.key, Some("123".to_string()));
 
     // Verify payload contains only extracted field
     let payload_json: Value = serde_json::from_slice(&result.payload).unwrap();
-    assert_eq!(payload_json, json!({"action": "login", "timestamp": "2023-01-01"}));
+    assert_eq!(
+        payload_json,
+        json!({"action": "login", "timestamp": "2023-01-01"})
+    );
 }
 
 #[test]
@@ -81,7 +86,8 @@ fn test_custom_template_transformation() {
         "test_queue",
         "user_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.id, 3);
     assert_eq!(result.key, Some("123".to_string()));
@@ -136,7 +142,8 @@ fn test_header_preservation() {
         "test_queue",
         "x-pgmq-group",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("user-456".to_string()));
 
@@ -170,7 +177,8 @@ fn test_nested_key_extraction() {
         "test_queue",
         "metadata.tenant_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("tenant-789".to_string()));
     assert_eq!(result.headers["pgmq_message_key"], "tenant-789");
@@ -189,7 +197,8 @@ fn test_key_extraction_fallback_to_message_id() {
         "test_queue",
         "nonexistent_field",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     // Should fall back to None since field doesn't exist
     assert_eq!(result.key, None);
@@ -210,7 +219,8 @@ fn test_header_priority_headers_over_message() {
         "test_queue",
         "user_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     // Should prefer header value over message value
     assert_eq!(result.key, Some("header-456".to_string()));
@@ -219,7 +229,10 @@ fn test_header_priority_headers_over_message() {
 
 #[test]
 fn test_value_to_string_conversion() {
-    assert_eq!(MessageTransformer::value_to_string(&json!("string")), "string");
+    assert_eq!(
+        MessageTransformer::value_to_string(&json!("string")),
+        "string"
+    );
     assert_eq!(MessageTransformer::value_to_string(&json!(123)), "123");
     assert_eq!(MessageTransformer::value_to_string(&json!(true)), "true");
     assert_eq!(MessageTransformer::value_to_string(&json!(false)), "false");

@@ -195,8 +195,7 @@ impl RabbitMQBroker {
 
         info!(
             "RabbitMQ broker '{}' initialized successfully with {} channel(s)",
-            name,
-            config.pool_size
+            name, config.pool_size
         );
 
         Ok(Self {

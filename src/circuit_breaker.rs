@@ -148,7 +148,9 @@ where
 
         // If the breaker is still over threshold but the recovery timeout has elapsed,
         // this permitted call is a half-open trial.
-        if self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
+        if self
+            .failure_count
+            .load(std::sync::atomic::Ordering::Relaxed)
             >= self.config.failure_threshold
         {
             self.metrics.record_state(&self.name, CB_STATE_HALF_OPEN);
@@ -188,7 +190,9 @@ where
                     // If this failure pushed the breaker over the threshold, surface the
                     // open state on the gauge immediately (rather than only on the next
                     // rejected call).
-                    if self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
+                    if self
+                        .failure_count
+                        .load(std::sync::atomic::Ordering::Relaxed)
                         >= self.config.failure_threshold
                     {
                         self.metrics.record_state(&self.name, CB_STATE_OPEN);
@@ -294,7 +298,11 @@ where
             randomization_factor: self.config.jitter,
             // Bound total retry time so a single operation cannot retry forever; the
             // per-operation retry count is also capped by `max_retries` in `execute`.
-            max_elapsed_time: Some(self.config.max_delay.saturating_mul(self.config.max_retries.max(1))),
+            max_elapsed_time: Some(
+                self.config
+                    .max_delay
+                    .saturating_mul(self.config.max_retries.max(1)),
+            ),
             ..ExponentialBackoff::default()
         };
         backoff.reset();

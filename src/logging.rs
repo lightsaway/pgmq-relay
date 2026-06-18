@@ -1,7 +1,7 @@
-/// Performance-optimized logging macros for pgmq-relay
-/// 
-/// These macros provide conditional compilation for expensive debug operations
-/// and structured logging with minimal runtime overhead.
+//! Performance-optimized logging macros for pgmq-relay.
+//!
+//! These macros provide conditional compilation for expensive debug operations
+//! and structured logging with minimal runtime overhead.
 
 /// Macro for expensive debug operations that should only run in debug builds
 /// or when explicitly enabled via feature flag.

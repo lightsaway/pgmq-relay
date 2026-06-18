@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use serde_json::Value;
 use crate::broker::RelayMessage;
 use crate::config::MessageTransformation;
 use crate::error::RelayError;
+use serde_json::Value;
+use std::collections::HashMap;
 
 /// Message transformer responsible for converting PGMQ messages to RelayMessages
 pub struct MessageTransformer;
@@ -30,10 +30,12 @@ impl MessageTransformer {
         record_metrics(queue_name, transformation_type, true);
 
         // Extract message key from headers first, then fall back to message body
-        let message_key = Self::extract_message_key_from_headers_or_message(headers, message, key_field);
+        let message_key =
+            Self::extract_message_key_from_headers_or_message(headers, message, key_field);
 
         // Build headers with original PGMQ headers and relay metadata
-        let relay_headers = Self::build_relay_headers(headers, msg_id, queue_name, &message_key, key_field);
+        let relay_headers =
+            Self::build_relay_headers(headers, msg_id, queue_name, &message_key, key_field);
 
         crate::trace_per_message!(
             message_id = msg_id,
@@ -74,7 +76,10 @@ impl MessageTransformer {
 
     /// Get the transformation type string for metrics
     fn get_transformation_type(transformation: &Option<MessageTransformation>) -> &'static str {
-        match transformation.as_ref().unwrap_or(&MessageTransformation::Passthrough) {
+        match transformation
+            .as_ref()
+            .unwrap_or(&MessageTransformation::Passthrough)
+        {
             MessageTransformation::Passthrough => "passthrough",
             MessageTransformation::JsonExtract { .. } => "json_extract",
             MessageTransformation::CustomTemplate { .. } => "custom_template",
@@ -86,16 +91,19 @@ impl MessageTransformer {
         message: &Value,
         transformation: &Option<MessageTransformation>,
     ) -> Result<Vec<u8>, RelayError> {
-        match transformation.as_ref().unwrap_or(&MessageTransformation::Passthrough) {
-            MessageTransformation::Passthrough => {
-                serde_json::to_vec(message)
-                    .map_err(|e| RelayError::MessageTransformation(e.to_string()))
-            }
+        match transformation
+            .as_ref()
+            .unwrap_or(&MessageTransformation::Passthrough)
+        {
+            MessageTransformation::Passthrough => serde_json::to_vec(message)
+                .map_err(|e| RelayError::MessageTransformation(e.to_string())),
             MessageTransformation::JsonExtract { field } => {
-                let extracted = message.get(field)
-                    .ok_or_else(|| RelayError::MessageTransformation(
-                        format!("Field '{}' not found in message", field)
-                    ))?;
+                let extracted = message.get(field).ok_or_else(|| {
+                    RelayError::MessageTransformation(format!(
+                        "Field '{}' not found in message",
+                        field
+                    ))
+                })?;
                 serde_json::to_vec(extracted)
                     .map_err(|e| RelayError::MessageTransformation(e.to_string()))
             }
@@ -118,28 +126,37 @@ impl MessageTransformer {
         let mut relay_headers = HashMap::new();
 
         // First, copy any original PGMQ headers to preserve them
-        if let Some(headers_obj) = headers {
-            if let Value::Object(header_map) = headers_obj {
-                for (key, value) in header_map {
-                    // Convert header values to strings, prefixed to indicate they're from PGMQ
-                    let header_value = Self::value_to_string(value);
-                    relay_headers.insert(format!("pgmq_header_{}", key), header_value);
-                }
+        if let Some(Value::Object(header_map)) = headers {
+            for (key, value) in header_map {
+                // Convert header values to strings, prefixed to indicate they're from PGMQ
+                let header_value = Self::value_to_string(value);
+                relay_headers.insert(format!("pgmq_header_{}", key), header_value);
             }
         }
 
         // Add relay-specific headers
         relay_headers.insert("pgmq_msg_id".to_string(), msg_id.to_string());
-        relay_headers.insert("pgmq_relay_timestamp".to_string(),
-                             chrono::Utc::now().to_rfc3339());
+        relay_headers.insert(
+            "pgmq_relay_timestamp".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
         relay_headers.insert("pgmq_queue_name".to_string(), queue_name.to_string());
 
         // If we have a key, also add it as a header for debugging
         if let Some(ref key) = message_key {
             relay_headers.insert("pgmq_message_key".to_string(), key.clone());
-            tracing::info!("Extracted message key '{}' from field '{}' for message {}", key, key_field, msg_id);
+            tracing::info!(
+                "Extracted message key '{}' from field '{}' for message {}",
+                key,
+                key_field,
+                msg_id
+            );
         } else {
-            tracing::info!("No message key found in field '{}' for message {}, using message ID as fallback", key_field, msg_id);
+            tracing::info!(
+                "No message key found in field '{}' for message {}, using message ID as fallback",
+                key_field,
+                msg_id
+            );
         }
 
         relay_headers
@@ -298,7 +315,8 @@ mod tests {
             "test_queue",
             "x-pgmq-group",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify the payload is the original message serialized
         let expected_payload = serde_json::to_vec(&message).unwrap();
@@ -307,7 +325,10 @@ mod tests {
         // Verify headers are set
         assert_eq!(result.headers.get("pgmq_msg_id").unwrap(), "123");
         assert!(result.headers.contains_key("pgmq_relay_timestamp"));
-        assert_eq!(result.headers.get("pgmq_message_key").unwrap(), "fifo_key_123");
+        assert_eq!(
+            result.headers.get("pgmq_message_key").unwrap(),
+            "fifo_key_123"
+        );
 
         // Verify key extraction
         assert_eq!(result.key, Some("fifo_key_123".to_string()));
@@ -331,7 +352,8 @@ mod tests {
             "test_queue",
             "correlation_id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify the payload is just the extracted order object
         let expected_order = message.get("order").unwrap();
@@ -377,7 +399,8 @@ mod tests {
         let headers = Some(create_test_headers());
 
         let transformation = Some(MessageTransformation::CustomTemplate {
-            template: "User {user_id} created order {order.id} for {order.amount} {order.currency}".to_string(),
+            template: "User {user_id} created order {order.id} for {order.amount} {order.currency}"
+                .to_string(),
         });
 
         let result = MessageTransformer::transform_message(
@@ -388,10 +411,14 @@ mod tests {
             "test_queue",
             "trace_id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         let payload_str = String::from_utf8(result.payload).unwrap();
-        assert_eq!(payload_str, "User user123 created order ord_456 for 99.99 USD");
+        assert_eq!(
+            payload_str,
+            "User user123 created order ord_456 for 99.99 USD"
+        );
 
         // Verify key extraction from headers
         assert_eq!(result.key, Some("trace_789".to_string()));
@@ -410,7 +437,8 @@ mod tests {
             "test_queue",
             "x-pgmq-group",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("fifo_key_123".to_string()));
     }
@@ -428,7 +456,8 @@ mod tests {
             "test_queue",
             "user_id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("user123".to_string()));
     }
@@ -445,9 +474,10 @@ mod tests {
             333,
             &None,
             "test_queue",
-            "user_id", // Not in headers, but in message
+            "user_id",    // Not in headers, but in message
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("user123".to_string()));
     }
@@ -465,7 +495,8 @@ mod tests {
             "test_queue",
             "metadata.tenant_id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("tenant_789".to_string()));
     }
@@ -483,7 +514,8 @@ mod tests {
             "test_queue",
             "order.id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("ord_456".to_string()));
     }
@@ -501,7 +533,8 @@ mod tests {
             "test_queue",
             "nonexistent.field",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should fall back to None (message ID will be used by Kafka client)
         assert_eq!(result.key, None);
@@ -522,23 +555,68 @@ mod tests {
         let headers = None;
 
         // Test string value
-        let result = MessageTransformer::transform_message(&message, &headers, 1, &None, "test", "string_field", |_, _, _| {}).unwrap();
+        let result = MessageTransformer::transform_message(
+            &message,
+            &headers,
+            1,
+            &None,
+            "test",
+            "string_field",
+            |_, _, _| {},
+        )
+        .unwrap();
         assert_eq!(result.key, Some("string_value".to_string()));
 
         // Test number value
-        let result = MessageTransformer::transform_message(&message, &headers, 2, &None, "test", "number_field", |_, _, _| {}).unwrap();
+        let result = MessageTransformer::transform_message(
+            &message,
+            &headers,
+            2,
+            &None,
+            "test",
+            "number_field",
+            |_, _, _| {},
+        )
+        .unwrap();
         assert_eq!(result.key, Some("42".to_string()));
 
         // Test boolean value
-        let result = MessageTransformer::transform_message(&message, &headers, 3, &None, "test", "bool_field", |_, _, _| {}).unwrap();
+        let result = MessageTransformer::transform_message(
+            &message,
+            &headers,
+            3,
+            &None,
+            "test",
+            "bool_field",
+            |_, _, _| {},
+        )
+        .unwrap();
         assert_eq!(result.key, Some("true".to_string()));
 
         // Test null value (should return None)
-        let result = MessageTransformer::transform_message(&message, &headers, 4, &None, "test", "null_field", |_, _, _| {}).unwrap();
+        let result = MessageTransformer::transform_message(
+            &message,
+            &headers,
+            4,
+            &None,
+            "test",
+            "null_field",
+            |_, _, _| {},
+        )
+        .unwrap();
         assert_eq!(result.key, None);
 
         // Test array value (should serialize as JSON)
-        let result = MessageTransformer::transform_message(&message, &headers, 5, &None, "test", "array_field", |_, _, _| {}).unwrap();
+        let result = MessageTransformer::transform_message(
+            &message,
+            &headers,
+            5,
+            &None,
+            "test",
+            "array_field",
+            |_, _, _| {},
+        )
+        .unwrap();
         assert_eq!(result.key, Some("[1,2,3]".to_string()));
     }
 
@@ -553,9 +631,10 @@ mod tests {
             777,
             &None,
             "test_queue",
-            "user_id", // Should fallback to message body
+            "user_id",    // Should fallback to message body
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("user123".to_string()));
     }
@@ -573,7 +652,8 @@ mod tests {
             "test_queue",
             "user_id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("user123".to_string()));
     }
@@ -597,7 +677,8 @@ mod tests {
             "test_queue",
             "user",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         let payload_str = String::from_utf8(result.payload).unwrap();
         // Missing fields should remain as placeholders
@@ -648,7 +729,8 @@ mod tests {
             "test_queue",
             "x-pgmq-group",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("header_key".to_string()));
 
@@ -661,7 +743,8 @@ mod tests {
             "test_queue",
             "user_id",
             |_, _, _| {}, // No-op metrics function for tests
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.key, Some("user_from_header".to_string()));
     }

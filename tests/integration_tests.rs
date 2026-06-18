@@ -1,5 +1,5 @@
-use pgmq_relay::transformer::MessageTransformer;
 use pgmq_relay::config::MessageTransformation;
+use pgmq_relay::transformer::MessageTransformer;
 use serde_json::{json, Value};
 use std::sync::Once;
 
@@ -40,7 +40,8 @@ async fn test_end_to_end_message_transformation() {
         "purchase_queue",
         "x-pgmq-group",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("purchase_queue_key".to_string()));
     assert_eq!(result.id, 12345);
@@ -60,9 +61,10 @@ async fn test_end_to_end_message_transformation() {
         12346,
         &transformation,
         "purchase_queue",
-        "user_id", // Not in headers, should fallback to message
+        "user_id",    // Not in headers, should fallback to message
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("user123".to_string()));
 
@@ -83,7 +85,8 @@ async fn test_end_to_end_message_transformation() {
         "purchase_queue",
         "correlation_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("corr789".to_string()));
 
@@ -115,7 +118,8 @@ async fn test_kafka_key_scenarios() {
         "orders",
         "x-pgmq-group",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("fifo_key_abc".to_string()));
 
@@ -132,7 +136,8 @@ async fn test_kafka_key_scenarios() {
         "orders",
         "order_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("order_123".to_string()));
 
@@ -145,7 +150,8 @@ async fn test_kafka_key_scenarios() {
         "orders",
         "customer.id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("cust_456".to_string()));
 
@@ -158,7 +164,8 @@ async fn test_kafka_key_scenarios() {
         "orders",
         "nonexistent_field",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, None);
 }
@@ -221,7 +228,8 @@ async fn test_header_vs_message_priority() {
         "test_queue",
         "priority",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("header_priority".to_string()));
 
@@ -233,7 +241,8 @@ async fn test_header_vs_message_priority() {
         "test_queue",
         "user_id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("hdr_user_456".to_string()));
 }
@@ -268,7 +277,8 @@ async fn test_realistic_fifo_scenario() {
         "order_processing",
         "x-pgmq-group",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify FIFO key is extracted correctly
     assert_eq!(result.key, Some("CUST-12345".to_string()));
@@ -276,7 +286,10 @@ async fn test_realistic_fifo_scenario() {
 
     // Verify headers are properly set
     assert_eq!(result.headers.get("pgmq_msg_id").unwrap(), "98765");
-    assert_eq!(result.headers.get("pgmq_message_key").unwrap(), "CUST-12345");
+    assert_eq!(
+        result.headers.get("pgmq_message_key").unwrap(),
+        "CUST-12345"
+    );
     assert!(result.headers.contains_key("pgmq_relay_timestamp"));
 
     // Verify payload is the complete message
@@ -319,7 +332,8 @@ async fn test_complex_template_transformation() {
         "audit_log",
         "x-tenant-id",
         |_, _, _| {}, // No-op metrics function for tests
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(result.key, Some("tenant_abc".to_string()));
 

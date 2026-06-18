@@ -1,0 +1,4 @@
+[advisories]
+# Retained in Cargo.lock by transitive package metadata, but not reachable in
+# any enabled target or feature graph. The advisory has no fixed release.
+ignore = ["RUSTSEC-2023-0071"]

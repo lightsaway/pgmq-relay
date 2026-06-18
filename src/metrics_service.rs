@@ -39,7 +39,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Result<Self, prometheus::Error> {
-        let registry = REGISTRY.get_or_init(|| Registry::new());
+        let registry = REGISTRY.get_or_init(Registry::new);
 
         let worker_operation_total = CounterVec::new(
             Opts::new(

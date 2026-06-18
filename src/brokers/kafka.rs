@@ -242,7 +242,7 @@ impl Validator for KafkaConfig {
 
         if self.transactions.is_enabled() {
             let timeout = self.transactions.get_timeout_ms();
-            if timeout < 1000 || timeout > 300000 {
+            if !(1000..=300000).contains(&timeout) {
                 // 1s to 5min
                 return Err(format!(
                     "transaction timeout {}ms out of range (1000-300000)",
@@ -327,9 +327,9 @@ impl KafkaBroker {
                 client_config.set("transactional.id", &unique_tx_id);
                 client_config.set(
                     "transaction.timeout.ms",
-                    &config.transactions.get_timeout_ms().to_string(),
+                    config.transactions.get_timeout_ms().to_string(),
                 );
-                client_config.set("retries", &config.transactions.get_retries().to_string());
+                client_config.set("retries", config.transactions.get_retries().to_string());
                 client_config.set("enable.idempotence", "true");
                 client_config.set("max.in.flight.requests.per.connection", "5");
                 client_config.set("acks", "all");
