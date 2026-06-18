@@ -1,28 +1,44 @@
 name: Release
 
-# Triggered by pushing a version tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
 on:
   push:
     tags:
       - "v*"
 
-# Needed to upload release assets and push images to GHCR.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # ---------------------------------------------------------------------------
-  # Cross-platform binaries (built natively per arch to avoid cross-compiling
-  # librdkafka's C/cmake build).
-  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate release
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Match tag to Cargo version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "${GITHUB_REF_NAME}" = "v${version}" || {
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          }
+
   binaries:
     name: Binary (${{ matrix.target }})
+    needs: validate
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -32,9 +48,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -45,55 +61,61 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config perl libsasl2-dev
 
-      - name: Install macOS build dependencies
-        if: runner.os == 'macOS'
-        run: brew install cmake
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: release
           key: ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
+        id: package
         shell: bash
         run: |
-          staging="pgmq-relay-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          asset="pgmq-relay-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          staging="${asset%.tar.gz}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/pgmq-relay" "$staging/"
-          cp README.md config.toml "$staging/" 2>/dev/null || true
-          tar czf "$staging.tar.gz" "$staging"
-          shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
-          echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+          cp README.md config.toml "$staging/"
+          tar czf "$asset" "$staging"
+          shasum -a 256 "$asset" > "$asset.sha256"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Attest binary archive
+        uses: actions/attest@v4
         with:
-          files: |
-            ${{ env.ASSET }}
-            ${{ env.ASSET }}.sha256
+          subject-path: ${{ steps.package.outputs.asset }}
 
-  # ---------------------------------------------------------------------------
-  # Multi-arch Docker image published to GitHub Container Registry (GHCR).
-  # ---------------------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   docker:
     name: Docker image
+    needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -102,19 +124,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags
+      - name: Derive image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          # From tag v1.2.3 produces: 1.2.3, 1.2, 1, latest
+          flavor: latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -122,5 +144,46 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
+
+      - name: Attest image
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - binaries
+      - docker
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets
+        working-directory: dist
+        run: |
+          sha256sum --check --ignore-missing *.sha256
+          cat *.sha256 > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/SHA256SUMS
