@@ -237,7 +237,7 @@ impl PgmqClient for PgmqClientImpl {
 
         let result = self
             .deletion_circuit_breaker
-            .execute(|| {
+            .execute(move || {
                 let pool = pool.clone();
                 let queue_name_owned = queue_name_owned.clone();
                 let msg_ids_owned = msg_ids_owned.clone();

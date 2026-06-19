@@ -322,13 +322,13 @@ PGMQ completion (delete/archive) is wrapped in a circuit breaker with exponentia
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PGMQ_RELAY_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failures before the breaker opens. |
+| `PGMQ_RELAY_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failed completion operations, after retries, before the breaker opens. |
 | `PGMQ_RELAY_CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | `30s` | Wait before a half-open trial after opening. |
 | `PGMQ_RELAY_CIRCUIT_BREAKER_INITIAL_DELAY` | `100ms` | First retry backoff. |
 | `PGMQ_RELAY_CIRCUIT_BREAKER_MAX_DELAY` | `10s` | Maximum retry backoff. |
-| `PGMQ_RELAY_CIRCUIT_BREAKER_MAX_RETRIES` | `5` | Max retries per operation. |
+| `PGMQ_RELAY_CIRCUIT_BREAKER_MAX_RETRIES` | `5` | Maximum attempts per operation, including the initial attempt. |
 | `PGMQ_RELAY_CIRCUIT_BREAKER_MULTIPLIER` | `2.0` | Backoff growth factor. |
-| `PGMQ_RELAY_CIRCUIT_BREAKER_JITTER` | `0.1` | Randomization factor (0.0–1.0). |
+| `PGMQ_RELAY_CIRCUIT_BREAKER_JITTER` | `0.1` | Values greater than zero enable full retry jitter. |
 
 When the breaker is open the relay stops sending to the broker (and `/ready` reports not-ready) to avoid deleting messages it cannot confirm.
 

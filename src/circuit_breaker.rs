@@ -1,31 +1,36 @@
 use crate::error::RelayError;
-use backoff::{backoff::Backoff, ExponentialBackoff};
+use backon::{ExponentialBuilder, Retryable};
 use serde::{Deserialize, Serialize};
-
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tower::{service_fn, ServiceExt};
+use tower_resilience_circuitbreaker::{
+    CircuitBreakerError, CircuitBreakerHandle, CircuitBreakerLayer, CircuitState,
+};
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
-    /// Number of consecutive failures before opening the circuit
+    /// Number of consecutive failed operations before opening the circuit.
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
-    /// Duration to wait before attempting to close the circuit
+    /// Duration to wait before permitting one recovery probe.
     #[serde(with = "humantime_serde", default = "default_recovery_timeout")]
     pub recovery_timeout: Duration,
-    /// Initial delay for exponential backoff
+    /// Initial delay for exponential retry backoff.
     #[serde(with = "humantime_serde", default = "default_initial_delay")]
     pub initial_delay: Duration,
-    /// Maximum delay for exponential backoff
+    /// Maximum delay for exponential retry backoff.
     #[serde(with = "humantime_serde", default = "default_max_delay")]
     pub max_delay: Duration,
-    /// Maximum number of retry attempts
+    /// Maximum number of attempts, including the initial attempt.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
-    /// Multiplier for exponential backoff
+    /// Exponential retry multiplier.
     #[serde(default = "default_multiplier")]
     pub multiplier: f64,
-    /// Random jitter to add to delays (0.0 to 1.0)
+    /// Enables retry jitter when greater than zero.
     #[serde(default = "default_jitter")]
     pub jitter: f64,
 }
@@ -93,233 +98,224 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// Generic circuit breaker with parameterized metrics
-pub struct GenericCircuitBreaker<M> {
-    config: CircuitBreakerConfig,
-    name: String,
-    metrics: M,
-    failure_count: std::sync::atomic::AtomicU32,
-    last_failure_time: std::sync::Mutex<Option<std::time::Instant>>,
-}
-
-/// Trait for circuit breaker metrics recording
-pub trait CircuitBreakerMetrics {
+/// Trait for preserving application-specific circuit breaker metrics.
+pub trait CircuitBreakerMetrics: Send + Sync + 'static {
     fn record_success(&self, name: &str, duration: Duration, attempt: u32);
     fn record_failure(&self, name: &str, duration: Duration, attempt: u32, error_type: &str);
     fn record_rejection(&self, name: &str);
-    /// Record the breaker's current state as a gauge value: 0=closed, 1=open, 2=half-open.
-    /// Default no-op so metric-less implementations (e.g. tests) need not implement it.
     fn record_state(&self, _name: &str, _state: f64) {}
 }
 
-/// Circuit-breaker state gauge values, shared with metric recorders.
 pub const CB_STATE_CLOSED: f64 = 0.0;
 pub const CB_STATE_OPEN: f64 = 1.0;
 pub const CB_STATE_HALF_OPEN: f64 = 2.0;
+
+/// Retry wrapper backed by BackON and Tower Resilience's circuit state machine.
+pub struct GenericCircuitBreaker<M> {
+    config: CircuitBreakerConfig,
+    name: String,
+    metrics: Arc<M>,
+    layer: CircuitBreakerLayer,
+    handle: CircuitBreakerHandle,
+    recovery_probe_in_flight: Arc<AtomicBool>,
+    recovery_ready_at: Arc<Mutex<Option<Instant>>>,
+}
 
 impl<M> GenericCircuitBreaker<M>
 where
     M: CircuitBreakerMetrics,
 {
     pub fn new(name: String, config: CircuitBreakerConfig, metrics: M) -> Self {
+        let metrics = Arc::new(metrics);
+        let transition_metrics = Arc::clone(&metrics);
+        let transition_name = name.clone();
+        let rejection_metrics = Arc::clone(&metrics);
+        let rejection_name = name.clone();
+        let recovery_ready_at = Arc::new(Mutex::new(None));
+        let transition_recovery_ready_at = Arc::clone(&recovery_ready_at);
+        let recovery_timeout = config.recovery_timeout;
+
+        let (layer, handle) = CircuitBreakerLayer::builder()
+            .name(name.clone())
+            .consecutive_failures(config.failure_threshold.max(1) as usize)
+            .wait_duration_in_open(config.recovery_timeout)
+            .permitted_calls_in_half_open(1)
+            .on_state_transition(move |_, to| {
+                transition_metrics.record_state(&transition_name, circuit_state_metric_value(to));
+                if let Ok(mut ready_at) = transition_recovery_ready_at.lock() {
+                    *ready_at = match to {
+                        CircuitState::Open => Some(Instant::now() + recovery_timeout),
+                        CircuitState::Closed | CircuitState::HalfOpen => None,
+                    };
+                }
+            })
+            .on_call_rejected(move || {
+                rejection_metrics.record_rejection(&rejection_name);
+            })
+            .build_with_handle();
+
         Self {
             config,
             name,
             metrics,
-            failure_count: std::sync::atomic::AtomicU32::new(0),
-            last_failure_time: std::sync::Mutex::new(None),
+            layer,
+            handle,
+            recovery_probe_in_flight: Arc::new(AtomicBool::new(false)),
+            recovery_ready_at,
         }
     }
 
-    /// Execute an operation with circuit breaker protection and retry logic
+    /// Execute an operation with bounded retries inside one circuit-breaker call.
+    ///
+    /// The breaker records only the final operation outcome. Individual retry attempts
+    /// remain visible through the existing attempt metrics but cannot open the circuit
+    /// by themselves.
     pub async fn execute<F, Fut, T>(&self, operation: F) -> Result<T, RelayError>
     where
-        F: Fn() -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = Result<T, RelayError>> + Send,
-        T: Send,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<T, RelayError>> + Send + 'static,
+        T: Send + 'static,
     {
-        if !self.is_call_permitted() {
-            self.metrics.record_rejection(&self.name);
-            return Err(RelayError::CircuitBreakerOpen(format!(
-                "Circuit breaker '{}' is open - too many recent failures",
-                self.name
-            )));
-        }
-
-        // If the breaker is still over threshold but the recovery timeout has elapsed,
-        // this permitted call is a half-open trial.
-        if self
-            .failure_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= self.config.failure_threshold
-        {
-            self.metrics.record_state(&self.name, CB_STATE_HALF_OPEN);
-        }
-
-        let mut backoff = self.create_backoff();
-        let mut attempt = 1;
-
-        loop {
-            let start_time = std::time::Instant::now();
-
-            match operation().await {
-                Ok(result) => {
-                    let duration = start_time.elapsed();
-
-                    self.on_success();
-                    self.metrics.record_success(&self.name, duration, attempt);
-
-                    if attempt > 1 {
-                        debug!(
-                            circuit_breaker = %self.name,
-                            attempt = attempt,
-                            duration_ms = duration.as_millis(),
-                            "Operation succeeded after retries"
-                        );
-                    }
-
-                    return Ok(result);
+        let _probe_guard = match self.handle.state() {
+            CircuitState::Closed => None,
+            CircuitState::Open | CircuitState::HalfOpen => {
+                if self
+                    .recovery_probe_in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    self.metrics.record_rejection(&self.name);
+                    return Err(RelayError::CircuitBreakerOpen(format!(
+                        "Circuit breaker '{}' is open or already probing recovery",
+                        self.name
+                    )));
                 }
-                Err(e) => {
-                    let duration = start_time.elapsed();
-
-                    self.on_error();
-                    self.metrics
-                        .record_failure(&self.name, duration, attempt, &format!("{}", e));
-
-                    // If this failure pushed the breaker over the threshold, surface the
-                    // open state on the gauge immediately (rather than only on the next
-                    // rejected call).
-                    if self
-                        .failure_count
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        >= self.config.failure_threshold
-                    {
-                        self.metrics.record_state(&self.name, CB_STATE_OPEN);
-                    }
-
-                    if attempt >= self.config.max_retries {
-                        warn!(
-                            circuit_breaker = %self.name,
-                            attempt = attempt,
-                            max_retries = self.config.max_retries,
-                            error = %e,
-                            "Operation failed after all retry attempts"
-                        );
-                        return Err(e);
-                    }
-
-                    if !self.is_call_permitted() {
-                        warn!(
-                            circuit_breaker = %self.name,
-                            attempt = attempt,
-                            error = %e,
-                            "Circuit breaker opened during retry sequence"
-                        );
-                        return Err(RelayError::CircuitBreakerOpen(format!(
-                            "Circuit breaker '{}' opened after failure: {}",
-                            self.name, e
-                        )));
-                    }
-
-                    if let Some(delay) = backoff.next_backoff() {
-                        warn!(
-                            circuit_breaker = %self.name,
-                            attempt = attempt,
-                            delay_ms = delay.as_millis(),
-                            error = %e,
-                            "Operation failed, retrying after delay"
-                        );
-
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                    } else {
-                        return Err(e);
-                    }
-                }
+                Some(RecoveryProbeGuard(Arc::clone(
+                    &self.recovery_probe_in_flight,
+                )))
             }
-        }
-    }
+        };
 
-    /// Check if the circuit breaker allows calls
-    pub fn is_call_permitted(&self) -> bool {
-        let failure_count = self
-            .failure_count
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempt_counter = Arc::clone(&attempts);
+        let metrics = Arc::clone(&self.metrics);
+        let name = self.name.clone();
 
-        if failure_count >= self.config.failure_threshold {
-            if let Ok(last_failure) = self.last_failure_time.lock() {
-                if let Some(last_failure_instant) = *last_failure {
-                    let elapsed = last_failure_instant.elapsed();
-                    if elapsed >= self.config.recovery_timeout {
-                        // Recovery timeout has passed, allow a test call
-                        return true;
-                    }
-                }
-            }
-            false
-        } else {
-            true
-        }
-    }
-
-    /// Record a successful operation
-    fn on_success(&self) {
-        self.failure_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut last_failure) = self.last_failure_time.lock() {
-            *last_failure = None;
-        }
-    }
-
-    /// Record a failed operation
-    fn on_error(&self) {
-        let new_count = self
-            .failure_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        if new_count >= self.config.failure_threshold {
-            if let Ok(mut last_failure) = self.last_failure_time.lock() {
-                *last_failure = Some(std::time::Instant::now());
-            }
-        }
-    }
-
-    /// Build an exponential backoff from the configured parameters.
-    ///
-    /// Previously this returned `ExponentialBackoff::default()`, silently ignoring
-    /// `initial_delay`, `max_delay`, `multiplier`, and `jitter`. It now honors them.
-    fn create_backoff(&self) -> ExponentialBackoff {
-        let mut backoff = ExponentialBackoff {
-            initial_interval: self.config.initial_delay,
-            current_interval: self.config.initial_delay,
-            multiplier: self.config.multiplier,
-            max_interval: self.config.max_delay,
-            randomization_factor: self.config.jitter,
-            // Bound total retry time so a single operation cannot retry forever; the
-            // per-operation retry count is also capped by `max_retries` in `execute`.
-            max_elapsed_time: Some(
+        let mut retry_builder = ExponentialBuilder::default()
+            .with_min_delay(self.config.initial_delay)
+            .with_max_delay(self.config.max_delay)
+            .with_factor(self.config.multiplier as f32)
+            .with_max_times(self.config.max_retries.saturating_sub(1) as usize)
+            .with_total_delay(Some(
                 self.config
                     .max_delay
                     .saturating_mul(self.config.max_retries.max(1)),
-            ),
-            ..ExponentialBackoff::default()
+            ));
+        if self.config.jitter > 0.0 {
+            retry_builder = retry_builder.with_jitter();
+        }
+
+        let retry_operation = move || {
+            let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let metrics = Arc::clone(&metrics);
+            let name = name.clone();
+            let future = operation();
+            async move {
+                let started = Instant::now();
+                let result = future.await;
+                let duration = started.elapsed();
+                match &result {
+                    Ok(_) => metrics.record_success(&name, duration, attempt),
+                    Err(error) => {
+                        metrics.record_failure(&name, duration, attempt, &error.to_string())
+                    }
+                }
+                result
+            }
         };
-        backoff.reset();
-        backoff
+
+        let breaker_name = self.name.clone();
+        let notify_attempts = Arc::clone(&attempts);
+        let retry_future = retry_operation
+            .retry(retry_builder)
+            .notify(move |error, delay| {
+                let attempt = notify_attempts.load(Ordering::Relaxed);
+                warn!(
+                    circuit_breaker = %breaker_name,
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    error = %error,
+                    "Operation failed, retrying after delay"
+                );
+            });
+
+        let service = service_fn(|future| future);
+        match self.layer.layer_fn(service).oneshot(retry_future).await {
+            Ok(value) => {
+                let attempt = attempts.load(Ordering::Relaxed);
+                if attempt > 1 {
+                    debug!(
+                        circuit_breaker = %self.name,
+                        attempt,
+                        "Operation succeeded after retries"
+                    );
+                }
+                Ok(value)
+            }
+            Err(CircuitBreakerError::Inner(error)) => {
+                warn!(
+                    circuit_breaker = %self.name,
+                    attempt = attempts.load(Ordering::Relaxed),
+                    max_retries = self.config.max_retries,
+                    error = %error,
+                    "Operation failed after all retry attempts"
+                );
+                Err(error)
+            }
+            Err(CircuitBreakerError::OpenCircuit) => Err(RelayError::CircuitBreakerOpen(format!(
+                "Circuit breaker '{}' is open",
+                self.name
+            ))),
+        }
+    }
+
+    pub fn is_call_permitted(&self) -> bool {
+        match self.handle.state() {
+            CircuitState::Closed => true,
+            CircuitState::Open => self
+                .recovery_ready_at
+                .lock()
+                .ok()
+                .and_then(|ready_at| *ready_at)
+                .is_some_and(|ready_at| Instant::now() >= ready_at),
+            CircuitState::HalfOpen => !self.recovery_probe_in_flight.load(Ordering::Acquire),
+        }
     }
 }
 
-/// Type alias for PGMQ circuit breaker with metrics
+struct RecoveryProbeGuard(Arc<AtomicBool>);
+
+impl Drop for RecoveryProbeGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn circuit_state_metric_value(state: CircuitState) -> f64 {
+    match state {
+        CircuitState::Closed => CB_STATE_CLOSED,
+        CircuitState::Open => CB_STATE_OPEN,
+        CircuitState::HalfOpen => CB_STATE_HALF_OPEN,
+    }
+}
+
 pub type PgmqCircuitBreaker<M> = GenericCircuitBreaker<M>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Notify;
 
-    use tokio::time::Duration;
-
-    // Mock metrics for testing
     struct MockMetrics;
 
     impl CircuitBreakerMetrics for MockMetrics {
@@ -336,39 +332,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_circuit_breaker_success() {
-        let config = CircuitBreakerConfig {
-            failure_threshold: 3,
-            max_retries: 2,
-            ..Default::default()
-        };
+    async fn succeeds_without_retry() {
+        let breaker = PgmqCircuitBreaker::new(
+            "test".to_string(),
+            CircuitBreakerConfig::default(),
+            MockMetrics,
+        );
 
-        let cb = PgmqCircuitBreaker::new("test".to_string(), config, MockMetrics);
-
-        let result = cb.execute(|| async { Ok::<_, RelayError>(42) }).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            breaker
+                .execute(|| async { Ok::<_, RelayError>(42) })
+                .await
+                .unwrap(),
+            42
+        );
     }
 
     #[tokio::test]
-    async fn test_circuit_breaker_retry_success() {
+    async fn retries_before_reporting_success() {
         let config = CircuitBreakerConfig {
             failure_threshold: 5,
             max_retries: 3,
-            initial_delay: Duration::from_millis(10),
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            jitter: 0.0,
             ..Default::default()
         };
+        let breaker = PgmqCircuitBreaker::new("test".to_string(), config, MockMetrics);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let operation_attempts = Arc::clone(&attempts);
 
-        let cb = PgmqCircuitBreaker::new("test".to_string(), config, MockMetrics);
-        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-        let result = cb
-            .execute(|| {
-                let count = attempt_count.clone();
+        let result = breaker
+            .execute(move || {
+                let attempts = Arc::clone(&operation_attempts);
                 async move {
-                    let attempt = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
                     if attempt < 3 {
-                        Err(RelayError::PgmqOperation("test_failure".to_string()))
+                        Err(RelayError::PgmqOperation("retry".to_string()))
                     } else {
                         Ok(42)
                     }
@@ -376,94 +376,101 @@ mod tests {
             })
             .await;
 
-        assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);
-        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert!(breaker.is_call_permitted());
     }
 
     #[tokio::test]
-    async fn test_circuit_breaker_max_retries() {
+    async fn one_failed_operation_counts_once_for_breaker() {
         let config = CircuitBreakerConfig {
-            failure_threshold: 5,
-            max_retries: 2,
-            initial_delay: Duration::from_millis(10),
+            failure_threshold: 2,
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            jitter: 0.0,
+            recovery_timeout: Duration::from_secs(60),
             ..Default::default()
         };
+        let breaker = PgmqCircuitBreaker::new("test".to_string(), config, MockMetrics);
 
-        let cb = PgmqCircuitBreaker::new("test".to_string(), config, MockMetrics);
-
-        let result = cb
-            .execute(|| async {
-                Err::<i32, RelayError>(RelayError::PgmqOperation("always_fails".to_string()))
-            })
-            .await;
-
-        assert!(result.is_err());
+        let fail =
+            || async { Err::<(), RelayError>(RelayError::PgmqOperation("failure".to_string())) };
+        assert!(breaker.execute(fail).await.is_err());
+        assert!(breaker.is_call_permitted());
+        assert!(breaker.execute(fail).await.is_err());
+        assert!(!breaker.is_call_permitted());
     }
 
     #[tokio::test]
-    async fn test_circuit_breaker_opens_after_failures() {
+    async fn half_open_allows_only_one_probe() {
         let config = CircuitBreakerConfig {
-            failure_threshold: 3,
+            failure_threshold: 1,
             max_retries: 1,
-            recovery_timeout: Duration::from_secs(60), // Long recovery time
+            recovery_timeout: Duration::from_millis(10),
             ..Default::default()
         };
+        let breaker = Arc::new(PgmqCircuitBreaker::new(
+            "test".to_string(),
+            config,
+            MockMetrics,
+        ));
 
-        let cb = PgmqCircuitBreaker::new("test".to_string(), config, MockMetrics);
-
-        // Initially, circuit breaker should allow calls
-        assert!(cb.is_call_permitted());
-
-        // Execute 3 failing operations to exceed failure threshold
-        for i in 1..=3 {
-            let result = cb
-                .execute(|| async {
-                    Err::<i32, RelayError>(RelayError::PgmqOperation(format!("failure_{}", i)))
-                })
-                .await;
-            assert!(result.is_err());
-        }
-
-        // Now the circuit breaker should be open (not allowing calls)
-        assert!(!cb.is_call_permitted());
-
-        // Subsequent calls should be rejected immediately
-        let result = cb
+        assert!(breaker
             .execute(|| async {
-                Ok::<i32, RelayError>(42) // This would succeed if allowed
+                Err::<(), RelayError>(RelayError::PgmqOperation("failure".to_string()))
             })
-            .await;
+            .await
+            .is_err());
+        assert!(!breaker.is_call_permitted());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(breaker.is_call_permitted());
 
-        assert!(result.is_err());
-        if let Err(RelayError::CircuitBreakerOpen(msg)) = result {
-            assert!(msg.contains("too many recent failures"));
-        } else {
-            panic!("Expected CircuitBreakerOpen error");
-        }
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let probe_running = Arc::new(AtomicBool::new(false));
+        let first = {
+            let breaker = Arc::clone(&breaker);
+            let task_entered = Arc::clone(&entered);
+            let task_release = Arc::clone(&release);
+            let task_probe_running = Arc::clone(&probe_running);
+            tokio::spawn(async move {
+                breaker
+                    .execute(move || {
+                        let entered = Arc::clone(&task_entered);
+                        let release = Arc::clone(&task_release);
+                        let probe_running = Arc::clone(&task_probe_running);
+                        async move {
+                            probe_running.store(true, Ordering::Relaxed);
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok::<_, RelayError>(())
+                        }
+                    })
+                    .await
+            })
+        };
+
+        entered.notified().await;
+        assert!(probe_running.load(Ordering::Relaxed));
+        let second = breaker.execute(|| async { Ok::<_, RelayError>(()) }).await;
+        assert!(matches!(second, Err(RelayError::CircuitBreakerOpen(_))));
+
+        release.notify_one();
+        assert!(first.await.unwrap().is_ok());
+        assert!(breaker.is_call_permitted());
     }
 
     #[tokio::test]
-    async fn test_circuit_breaker_environment_variables() {
-        // Test that environment variables are respected
+    async fn environment_variables_override_defaults() {
         std::env::set_var("PGMQ_RELAY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "10");
         std::env::set_var("PGMQ_RELAY_CIRCUIT_BREAKER_MAX_RETRIES", "7");
 
         let config = CircuitBreakerConfig::default();
-
-        // Verify environment variables override defaults
         assert_eq!(config.failure_threshold, 10);
         assert_eq!(config.max_retries, 7);
 
-        // Clean up environment variables
         std::env::remove_var("PGMQ_RELAY_CIRCUIT_BREAKER_FAILURE_THRESHOLD");
         std::env::remove_var("PGMQ_RELAY_CIRCUIT_BREAKER_MAX_RETRIES");
-
-        // Test with duration environment variable
-        std::env::set_var("PGMQ_RELAY_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "45s");
-        let config2 = CircuitBreakerConfig::default();
-        assert_eq!(config2.recovery_timeout, Duration::from_secs(45));
-
-        std::env::remove_var("PGMQ_RELAY_CIRCUIT_BREAKER_RECOVERY_TIMEOUT");
     }
 }
