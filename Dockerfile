@@ -13,6 +13,7 @@ RUN apk add --no-cache \
     g++ \
     openssl-dev \
     openssl-libs-static \
+    zlib-static \
     curl-dev \
     cyrus-sasl-dev \
     perl \
