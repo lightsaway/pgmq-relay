@@ -61,7 +61,7 @@ tower-resilience-circuitbreaker = "0.10"
 
 # Metrics and monitoring
 prometheus = "0.14"
-axum = "0.7"
+axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors"] }
 hyper = "1.0"
