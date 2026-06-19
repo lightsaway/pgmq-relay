@@ -4,26 +4,53 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "09:00"
+      timezone: America/Edmonton
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
     groups:
-      rust-dependencies:
+      rust-minor-and-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "09:15"
+      timezone: America/Edmonton
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - github-actions
     groups:
-      actions:
+      actions-minor-and-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "09:30"
+      timezone: America/Edmonton
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - docker
     groups:
-      container-images:
+      containers-minor-and-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
