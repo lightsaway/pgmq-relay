@@ -1,13 +1,15 @@
 use async_nats::{Client, ConnectOptions, HeaderMap};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::broker::{MessageBroker, RelayMessage, SendResult};
 use crate::error::RelayError;
 use crate::validator::Validator;
 use serde::{Deserialize, Serialize};
+
+const NATS_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsConfig {
@@ -58,6 +60,12 @@ fn default_max_reconnects() -> usize {
 
 fn default_reconnect_delay_ms() -> u64 {
     5000 // 5 seconds
+}
+
+fn reconnect_delay(base_delay_ms: u64, attempts: usize) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(5) as u32;
+    let multiplier = 2u64.saturating_pow(exponent);
+    Duration::from_millis(base_delay_ms.saturating_mul(multiplier))
 }
 
 impl Default for NatsConfig {
@@ -113,22 +121,18 @@ impl NatsBroker {
             .map(|s| s.trim().to_string())
             .collect();
 
+        let max_reconnects = if config.max_reconnects == 0 {
+            None
+        } else {
+            Some(config.max_reconnects)
+        };
         let mut connect_opts = ConnectOptions::new()
             .name(&config.client_name)
-            .retry_on_initial_connect();
+            .max_reconnects(max_reconnects);
 
         let reconnect_delay_ms = config.reconnect_delay_ms;
-        let max_reconnects = config.max_reconnects;
         connect_opts = connect_opts.reconnect_delay_callback(move |attempts| {
-            // If max_reconnects is set (> 0) and we've exceeded it, use a very long delay
-            // to effectively stop reconnection attempts
-            if max_reconnects > 0 && attempts >= max_reconnects {
-                std::time::Duration::from_secs(86400) // 24 hours - effectively infinite
-            } else {
-                // Simple exponential backoff with base delay
-                let backoff_multiplier = 2u64.saturating_pow((attempts as u32).min(5));
-                std::time::Duration::from_millis(reconnect_delay_ms * backoff_multiplier)
-            }
+            reconnect_delay(reconnect_delay_ms, attempts)
         });
 
         if let Some(ref token) = config.token {
@@ -139,12 +143,36 @@ impl NatsBroker {
             connect_opts = connect_opts.user_and_password(username.clone(), password.clone());
         }
 
-        // Connect to NATS - use the first URL for simplicity
-        // async-nats will handle clustering through the server list from the first connection
-        let client = async_nats::connect_with_options(&servers[0], connect_opts)
+        let client = tokio::time::timeout(
+            NATS_READY_TIMEOUT,
+            async_nats::connect_with_options(servers, connect_opts),
+        )
+        .await
+        .map_err(|_| {
+            RelayError::BrokerConfiguration(format!(
+                "Timed out after {}s connecting to NATS broker '{}'",
+                NATS_READY_TIMEOUT.as_secs(),
+                name
+            ))
+        })?
+        .map_err(|e| {
+            RelayError::BrokerConfiguration(format!("Failed to connect to NATS: {}", e))
+        })?;
+
+        tokio::time::timeout(NATS_READY_TIMEOUT, client.flush())
             .await
+            .map_err(|_| {
+                RelayError::BrokerConfiguration(format!(
+                    "Timed out after {}s waiting for NATS broker '{}' to become ready",
+                    NATS_READY_TIMEOUT.as_secs(),
+                    name
+                ))
+            })?
             .map_err(|e| {
-                RelayError::BrokerConfiguration(format!("Failed to connect to NATS: {}", e))
+                RelayError::BrokerConfiguration(format!(
+                    "NATS broker '{}' readiness check failed: {}",
+                    name, e
+                ))
             })?;
 
         info!("Connected to NATS server(s): {}", config.url);
@@ -356,5 +384,19 @@ impl MessageBroker for NatsBroker {
                 self.name, e
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_starts_at_base_delay_and_is_capped() {
+        assert_eq!(reconnect_delay(5_000, 0), Duration::from_secs(5));
+        assert_eq!(reconnect_delay(5_000, 1), Duration::from_secs(5));
+        assert_eq!(reconnect_delay(5_000, 2), Duration::from_secs(10));
+        assert_eq!(reconnect_delay(5_000, 6), Duration::from_secs(160));
+        assert_eq!(reconnect_delay(5_000, 100), Duration::from_secs(160));
     }
 }
