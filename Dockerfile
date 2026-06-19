@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Build stage - use Alpine for minimal image size
-FROM rust:1.88-alpine AS builder
+FROM rust:1.96-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/pgmq-relay /tmp/pgmq-relay
 
 # Create a new stage with a minimal image
-FROM alpine:3.21
+FROM alpine:3.24
 
 # Install runtime dependencies
 RUN apk add --no-cache \
