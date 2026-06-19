@@ -1,26 +1,47 @@
-# Delivery Semantics
+# Delivery Guarantees
 
-PGMQ Relay normally provides at-least-once delivery.
+## Normal modes: at least once
 
-For non-`pop` fetch modes, a worker:
+All fetch modes except `pop` use this sequence:
 
-1. Reads messages from PGMQ with a visibility timeout.
-2. Transforms each message.
-3. Sends transformed messages to the broker.
-4. Waits for broker acknowledgement, confirm, flush, or transaction commit.
-5. Deletes or archives only messages that were delivered or dead-lettered.
+<div class="sequence">
+  <div><b>1</b><span>Read from PGMQ</span><small>The row becomes invisible for the visibility timeout.</small></div>
+  <div><b>2</b><span>Transform</span><small>Failures are isolated and optionally dead-lettered.</small></div>
+  <div><b>3</b><span>Publish</span><small>The relay waits for the broker-specific success boundary.</small></div>
+  <div><b>4</b><span>Complete in PGMQ</span><small>Delivered rows are deleted or archived.</small></div>
+</div>
 
-If the process crashes after broker delivery but before PGMQ completion, PGMQ will redeliver the message after the visibility timeout. Downstream consumers should be idempotent or deduplicate by message key or relay headers.
+If the relay crashes after publish succeeds but before PGMQ completion succeeds, the message becomes visible again and is published again.
 
-## Poison Messages
+This is intentional at-least-once behavior. Consumers must support duplicates.
 
-If transformation fails, the message is isolated from the rest of the batch.
+## Broker success boundaries
 
-- With `dead_letter_queue` configured, the relay sends the original payload to that queue and then completes the source message.
-- Without `dead_letter_queue`, the source message is left in PGMQ and retried after the visibility timeout.
+| Broker mode | Considered successful when | Important limitation |
+|---|---|---|
+| Kafka transactions | Transaction commit succeeds | PGMQ completion is outside the Kafka transaction |
+| Kafka without transactions | Individual delivery future succeeds | Partial batch success is possible |
+| RabbitMQ | Publisher confirm succeeds | A timeout can leave acceptance uncertain |
+| Core NATS | Connection flush succeeds | Flush is not durable storage |
+| JetStream | Stream acknowledgement succeeds | The target stream must already exist and match the subject |
 
-## Pop Mode
+## Duplicate keys
 
-`fetch_mode = "pop"` uses `pgmq.pop()`, which removes messages during fetch. If transformation, broker delivery, or the relay process fails afterward, those messages cannot be retried by PGMQ.
+Prefer a stable domain event identifier. The relay also adds `pgmq_msg_id` to message headers, but PGMQ IDs are only meaningful with their source queue.
 
-The relay logs a startup warning when a queue uses `pop`.
+Kafka transactions prevent partially committed Kafka transactions and fence stale producers. They do not provide end-to-end exactly-once delivery between PostgreSQL and Kafka.
+
+## Poison messages
+
+When transformation fails:
+
+- With `dead_letter_queue`, the original message is inserted into that PGMQ queue and the source row is completed.
+- Without `dead_letter_queue`, the source row remains and becomes visible after its timeout.
+
+The dead-letter operation preserves the original headers and adds diagnostic metadata. See [Message Headers](./reference/headers.md).
+
+## Pop mode: at most once
+
+`fetch_mode = "pop"` removes rows while fetching them. A later transformation error, broker error, process crash, or network failure loses those messages.
+
+The relay logs a startup warning for every `pop` queue. Use it only when loss is explicitly acceptable.

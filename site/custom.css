@@ -1,0 +1,115 @@
+:root {
+  --relay-accent: #087f5b;
+  --relay-border: #cbd5e1;
+  --relay-muted: #64748b;
+  --relay-panel: #f8fafc;
+}
+
+.content main {
+  max-width: 920px;
+}
+
+.content main > h1 {
+  border-bottom: 2px solid var(--relay-accent);
+  padding-bottom: 0.35em;
+}
+
+table {
+  display: table;
+  width: 100%;
+}
+
+.flow {
+  align-items: stretch;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr;
+  margin: 1.5rem 0;
+}
+
+.flow-node {
+  background: var(--relay-panel);
+  border: 1px solid var(--relay-border);
+  border-left: 4px solid var(--relay-accent);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 5rem;
+  padding: 0.85rem;
+}
+
+.flow-node span,
+.sequence small {
+  color: var(--relay-muted);
+  margin-top: 0.3rem;
+}
+
+.flow-arrow {
+  align-self: center;
+  color: var(--relay-muted);
+  font-size: 0.8rem;
+  text-align: center;
+  width: 5rem;
+}
+
+.flow-arrow::after {
+  content: " ->";
+  color: var(--relay-accent);
+  font-weight: 700;
+}
+
+.sequence {
+  counter-reset: step;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(4, 1fr);
+  margin: 1.5rem 0;
+}
+
+.sequence > div {
+  background: var(--relay-panel);
+  border: 1px solid var(--relay-border);
+  min-height: 8rem;
+  padding: 0.8rem;
+}
+
+.sequence b {
+  background: var(--relay-accent);
+  color: white;
+  display: inline-grid;
+  height: 1.7rem;
+  place-items: center;
+  width: 1.7rem;
+}
+
+.sequence span,
+.sequence small {
+  display: block;
+}
+
+.sequence span {
+  font-weight: 700;
+  margin-top: 0.6rem;
+}
+
+@media (max-width: 760px) {
+  .flow,
+  .sequence {
+    grid-template-columns: 1fr;
+  }
+
+  .flow-arrow {
+    width: auto;
+  }
+
+  .flow-arrow::after {
+    content: " down";
+  }
+}
+
+@media print {
+  .flow,
+  .sequence {
+    break-inside: avoid;
+  }
+}

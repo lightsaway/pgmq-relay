@@ -1,12 +1,24 @@
-# Configuration
+# Configuration Overview
 
-The relay is configured with TOML. By default it reads `config.toml`; pass `--config` to use another path.
+The relay reads TOML from `config.toml` by default:
+
+```bash
+pgmq-relay --config /etc/pgmq-relay/config.toml
+```
+
+Validate syntax and cross-references without connecting to PostgreSQL or brokers:
+
+```bash
+pgmq-relay --config config.toml --validate-config
+```
+
+## Minimal configuration
 
 ```toml
-default_broker = "my_kafka"
+default_broker = "kafka"
 
 [pgmq]
-connection_url = "postgres://postgres:postgres@localhost:5432/postgres"
+connection_url = "postgres://relay:secret@postgres:5432/app"
 max_connections = 10
 
 [metrics]
@@ -14,63 +26,51 @@ enabled = true
 bind_address = "0.0.0.0"
 port = 9090
 
-[brokers.my_kafka]
+[brokers.kafka]
 type = "kafka"
-bootstrap_servers = "localhost:9092"
+bootstrap_servers = "kafka:9092"
 
 [[queues]]
-queue_name = "my_queue"
-destination_topic = "my_topic"
-fetch_mode = "regular"
-key_field = "x-pgmq-group"
-parallelism = 1
+queue_name = "outbox"
+destination_topic = "events"
+key_field = "event_id"
 batch_size = 100
-poll_interval = "250ms"
 visibility_timeout_seconds = 30
-archive_messages = false
-dead_letter_queue = "my_queue_dlq"
 ```
 
-## Top-Level Keys
+Top-level keys such as `default_broker` must appear before TOML table headers.
 
-| Key | Description |
-|---|---|
-| `default_broker` | Broker used by queues that do not set `broker_name`. |
-| `broker_name` | Deprecated legacy fallback. Prefer `default_broker`. |
+## Queue routing
 
-## PGMQ
+Every queue selects `broker_name`, then falls back to `default_broker`.
 
-| Key | Description |
-|---|---|
-| `connection_url` | PostgreSQL connection string. Must start with `postgres://` or `postgresql://`. |
-| `max_connections` | Postgres connection pool size. Range: 1-100. |
+```toml
+default_broker = "kafka"
 
-## Queues
+[[queues]]
+queue_name = "events"
 
-| Key | Description |
-|---|---|
-| `queue_name` | PGMQ queue to consume. |
-| `destination_topic` | Broker topic, subject, or routing key. Defaults to `queue_name`. |
-| `fetch_mode` | PGMQ read mode. Defaults to `regular`. |
-| `parallelism` | Number of workers for this queue. |
-| `batch_size` | Number of messages per poll. Range: 1-1000. |
-| `visibility_timeout_seconds` | PGMQ visibility timeout. |
-| `archive_messages` | Archive instead of delete successfully processed messages. |
-| `dead_letter_queue` | Optional PGMQ queue for transformation failures. |
-| `broker_name` | Optional per-queue broker override. |
+[[queues]]
+queue_name = "notifications"
+broker_name = "rabbit"
+```
 
-## Fetch Modes
+`destination_topic` means:
 
-Supported values:
+- Kafka topic
+- NATS subject
+- RabbitMQ fallback routing key when no message key exists
 
-- `regular`
-- `read_with_poll`
-- `read_grouped`
-- `read_grouped_with_poll`
-- `read_grouped_rr`
-- `read_grouped_rr_with_poll`
-- `read_grouped_head`
-- `read_grouped_head_with_poll`
-- `pop`
+RabbitMQ normally uses the extracted message key as its routing key.
 
-`pop` removes messages from PGMQ before broker delivery. Use it only when message loss is acceptable.
+When the configured field is absent, Kafka falls back to the PGMQ message ID, RabbitMQ falls back to `destination_topic`, and NATS keeps the base subject.
+
+## Visibility timeout
+
+The visibility timeout must cover the longest expected transformation, publish, acknowledgement, and PGMQ completion time. With parallel workers, an expired timeout can expose the same row to another worker.
+
+For RabbitMQ, keep `visibility_timeout_seconds * 1000` greater than `ack_timeout_ms`. The relay warns when this is not true.
+
+## Configuration sources
+
+Most settings are TOML-only. Environment variables provide defaults for selected fields when the TOML value is omitted. See [Environment Variables](./reference/environment.md) and the [complete reference](./reference/configuration.md).

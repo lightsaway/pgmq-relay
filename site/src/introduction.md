@@ -1,43 +1,39 @@
 # PGMQ Relay
 
-PGMQ Relay is a Rust service that reads messages from PGMQ queues and forwards them to message brokers such as Kafka, RabbitMQ, and NATS.
+PGMQ Relay moves messages from [PGMQ](https://github.com/pgmq/pgmq) queues in PostgreSQL to Kafka, RabbitMQ, or NATS.
 
-The relay is designed around at-least-once delivery. A worker reads a batch from PGMQ, transforms each message, sends successfully transformed messages to the configured broker, then deletes or archives only the messages that were delivered or dead-lettered.
+It is intended for systems that use Postgres as a transactional outbox or durable queue but need to publish those messages to an external broker.
 
-## Features
+## What it guarantees
 
-- Multiple queues with per-queue parallelism.
-- Kafka, RabbitMQ, and NATS broker support.
-- Passthrough, JSON extraction, and template-based message transformation.
-- Dead-letter routing for poison messages.
-- Prometheus metrics plus `/health` and `/ready` endpoints.
-- Config validation before startup.
+For every fetch mode except `pop`, the relay completes a source message only after the destination broker reports success. This provides **at-least-once delivery** across the PGMQ-to-broker boundary.
 
-## Architecture
+At-least-once means duplicates are possible. Consumers must be idempotent or deduplicate using `pgmq_msg_id`, a domain event ID, or another stable key.
 
-```mermaid
-flowchart LR
-    subgraph PG["PostgreSQL + PGMQ"]
-        Q[("source queue")]
-        DLQ[("dead-letter queue")]
-    end
+See [Delivery Guarantees](./delivery-semantics.md) before using the relay for critical data.
 
-    subgraph RELAY["pgmq-relay"]
-        W1["worker 1"]
-        W2["worker 2"]
-        OBS["/metrics /health /ready"]
-    end
+## Supported destinations
 
-    subgraph BROKERS["Brokers"]
-        K["Kafka"]
-        R["RabbitMQ"]
-        N["NATS"]
-    end
+| Broker | Success boundary |
+|---|---|
+| Kafka | Producer acknowledgement; optional transaction commit |
+| RabbitMQ | Publisher confirmation |
+| Core NATS | Successful connection flush |
+| NATS JetStream | Per-message stream acknowledgement |
 
-    Q --> W1
-    Q --> W2
-    W1 --> K
-    W2 --> R
-    W2 -.-> N
-    W1 -. poison .-> DLQ
-```
+## Capabilities
+
+- Multiple PGMQ queues in one process
+- Per-queue broker selection and worker parallelism
+- Regular, long-polling, grouped FIFO, round-robin grouped, and `pop` fetch modes
+- Passthrough, JSON extraction, and template transformations
+- PGMQ dead-letter queues for transformation failures
+- Prometheus metrics and liveness/readiness endpoints
+- Supervised workers and bounded graceful shutdown
+
+## Start here
+
+1. [Install the relay](./install.md).
+2. Run the [Docker Compose quick start](./quick-start.md).
+3. [Send and verify a message](./first-message.md).
+4. Select a broker: [Kafka](./brokers/kafka.md), [RabbitMQ](./brokers/rabbitmq.md), or [NATS](./brokers/nats.md).

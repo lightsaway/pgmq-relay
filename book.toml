@@ -16,6 +16,7 @@ site-url = "/pgmq-relay/"
 default-theme = "light"
 preferred-dark-theme = "navy"
 smart-punctuation = true
+additional-css = ["site/custom.css"]
 
 [output.html.print]
 enable = true
