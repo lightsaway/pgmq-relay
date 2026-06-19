@@ -23,13 +23,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Match tag to Cargo version
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          test "${GITHUB_REF_NAME}" = "v${version}" || {
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
-            exit 1
-          }
+        run: make release-validate TAG="${GITHUB_REF_NAME}"
 
   binaries:
     name: Binary (${{ matrix.target }})
@@ -72,7 +66,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: make build-release TARGET=${{ matrix.target }}
 
       - name: Package
         id: package

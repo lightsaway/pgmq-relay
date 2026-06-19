@@ -1,7 +1,16 @@
 # pgmq-relay Makefile
-# Provides build, test, and Docker operations for the pgmq-relay project
 
-.PHONY: help build test clean docker-build docker-run docker-stop docker-compose-up docker-compose-down docker-logs fmt clippy check install dev prod site site-serve
+CARGO ?= cargo
+MDBOOK ?= mdbook
+LYCHEE ?= lychee
+DOCKER ?= docker
+COMPOSE ?= docker compose
+TARGET_ARG = $(if $(TARGET),--target $(TARGET),)
+
+.PHONY: help build build-release check fmt fmt-check clippy test clean \
+	docker-build docker-run docker-stop docker-compose-up docker-compose-down \
+	docker-compose-logs site site-check site-serve security-audit \
+	ci-quality ci-test ci-docs ci-audit ci-check
 
 # Default target
 help: ## Show this help message
@@ -12,23 +21,26 @@ help: ## Show this help message
 
 # Build targets
 build: ## Build the project in debug mode
-	cargo build
+	$(CARGO) build --locked
 
 build-release: ## Build the project in release mode
-	cargo build --release
+	$(CARGO) build --release --locked $(TARGET_ARG)
 
 check: ## Check the project for compilation errors
-	cargo check
+	$(CARGO) check --locked --all-targets --all-features
 
 fmt: ## Format the code
-	cargo fmt
+	$(CARGO) fmt --all
+
+fmt-check: ## Check formatting without changing files
+	$(CARGO) fmt --all --check
 
 clippy: ## Run clippy lints
-	cargo clippy -- -D warnings
+	$(CARGO) clippy --locked --all-targets --all-features -- -D warnings
 
 # Test targets
 test: ## Run all tests
-	cargo test
+	$(CARGO) test --locked --all-targets --all-features
 
 test-unit: ## Run unit tests only
 	cargo test --lib
@@ -56,44 +68,43 @@ install: ## Install the binary
 	cargo install --path .
 
 clean: ## Clean build artifacts
-	cargo clean
-	docker system prune -f
+	$(CARGO) clean
+	$(MDBOOK) clean
 
 # Docker targets
 docker-build: ## Build production Docker image
-	docker build -t pgmq-relay:latest .
+	$(DOCKER) build -t pgmq-relay:local .
 
 docker-build-dev: ## Build development Docker image
 	docker build -f Dockerfile.dev -t pgmq-relay:dev .
 
 docker-run: ## Run the Docker container
-	docker run --rm --name pgmq-relay \
+	$(DOCKER) run --rm --name pgmq-relay \
 		-p 9090:9090 \
-		-e PGMQ_RELAY_CONNECTION_URL=${PGMQ_CONNECTION_URL:-postgres://postgres:password@localhost:5432/pgmq} \
-		-e PGMQ_RELAY_KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092} \
-		pgmq-relay:latest
+		-v "$(CURDIR)/config.toml:/etc/pgmq-relay/config.toml:ro" \
+		pgmq-relay:local
 
 docker-stop: ## Stop the running Docker container
-	docker stop pgmq-relay || true
+	$(DOCKER) stop pgmq-relay || true
 
 docker-shell: ## Get a shell in the Docker container
-	docker run --rm -it --entrypoint /bin/sh pgmq-relay:latest
+	$(DOCKER) run --rm -it --entrypoint /bin/sh pgmq-relay:local
 
 # Docker Compose targets
 docker-compose-up: ## Start all services with docker-compose
-	docker-compose up -d
+	$(COMPOSE) up -d
 
 docker-compose-down: ## Stop all services with docker-compose
-	docker-compose down
+	$(COMPOSE) down
 
 docker-compose-logs: ## Show logs from docker-compose services
-	docker-compose logs -f
+	$(COMPOSE) logs -f
 
 docker-compose-restart: ## Restart docker-compose services
-	docker-compose restart
+	$(COMPOSE) restart
 
 docker-compose-build: ## Build and start services with docker-compose
-	docker-compose up --build -d
+	$(COMPOSE) up --build -d
 
 # Development aliases for main docker-compose
 dev-up: docker-compose-up ## Start development environment (alias for docker-compose-up)
@@ -101,15 +112,15 @@ dev-up: docker-compose-up ## Start development environment (alias for docker-com
 dev-down: docker-compose-down ## Stop development environment (alias for docker-compose-down)
 
 dev-logs: ## Show logs from pgmq-relay container
-	docker-compose logs -f pgmq-relay
+	$(COMPOSE) logs -f pgmq-relay
 
 dev-build: docker-compose-build ## Build and start development environment (alias for docker-compose-build)
 
 dev-restart: ## Restart pgmq-relay container
-	docker-compose restart pgmq-relay
+	$(COMPOSE) restart pgmq-relay
 
 dev-shell: ## Get a shell in the pgmq-relay container
-	docker-compose exec pgmq-relay /bin/bash
+	$(COMPOSE) exec pgmq-relay /bin/sh
 
 # Production targets
 prod: build-release ## Build production binary
@@ -120,10 +131,10 @@ deploy-prep: test clippy fmt build-release ## Prepare for deployment (run all ch
 
 # Utility targets
 logs: ## Show application logs (when running via docker-compose)
-	docker-compose logs -f pgmq-relay
+	$(COMPOSE) logs -f pgmq-relay
 
 status: ## Show status of docker-compose services
-	docker-compose ps
+	$(COMPOSE) ps
 
 env-example: ## Create example environment file
 	@echo "# pgmq-relay environment variables" > .env.example
@@ -171,7 +182,7 @@ docker-buildx: ## Build multi-platform Docker images
 
 # Security scanning
 security-audit: ## Run security audit
-	cargo audit
+	cargo-audit audit
 
 # Documentation
 docs: ## Generate and open documentation
@@ -181,27 +192,35 @@ docs-build: ## Build documentation without opening
 	cargo doc --no-deps
 
 site: ## Build the GitHub Pages static site with mdBook
-	mdbook build
+	$(MDBOOK) build
+
+site-check: site ## Build the site and validate generated links
+	$(LYCHEE) --offline --no-progress --exclude-path 'book/404.html' book
 
 site-serve: ## Serve the mdBook site locally
-	mdbook serve --open
+	$(MDBOOK) serve --open
 
 # Version management
 version: ## Show current version
 	@grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/'
 
+release-validate: ## Verify TAG matches the Cargo package version
+	@test -n "$(TAG)" || { echo "TAG is required, for example TAG=v0.1.0"; exit 1; }
+	@test "$(TAG)" = "v$$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')" || { \
+		echo "Tag $(TAG) does not match Cargo.toml version v$$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"; \
+		exit 1; \
+	}
+
 # CI/CD helpers
-ci-test: ## Run tests in CI environment
-	cargo test --release
+ci-quality: fmt-check clippy ## Run formatting and lint checks used by CI
 
-ci-build: ## Build in CI environment
-	cargo build --release
+ci-test: test ## Run the test command used by CI
 
-ci-check: ## Full CI check pipeline
-	cargo fmt --check
-	cargo clippy -- -D warnings
-	cargo test --release
-	cargo build --release
+ci-docs: site-check ## Build and link-check the documentation used by CI
+
+ci-audit: security-audit ## Run the dependency audit used by CI
+
+ci-check: ci-quality ci-test ci-docs ## Run deterministic local CI checks
 
 # Environment setup
 setup-dev: ## Setup development environment

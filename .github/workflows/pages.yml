@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
   workflow_dispatch:
 
 permissions:
@@ -26,13 +25,18 @@ jobs:
       - name: Install mdBook
         uses: taiki-e/install-action@v2
         with:
-          tool: mdbook
+          tool: mdbook@0.5.3
+
+      - name: Install link checker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: lychee@0.24.2
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
-      - name: Build site
-        run: mdbook build
+      - name: Build and check site
+        run: make ci-docs
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
