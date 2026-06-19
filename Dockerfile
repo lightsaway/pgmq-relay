@@ -41,7 +41,8 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/pgmq-relay/target \
-    cargo build --release --locked \
+    cargo clean --release -p pgmq-relay \
+    && cargo build --release --locked \
     && cp target/release/pgmq-relay /tmp/pgmq-relay
 
 # Create a new stage with a minimal image
@@ -80,7 +81,7 @@ ENV RUST_LOG=info
 
 # Health check using wget (smaller than curl)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD wget -q --spider http://localhost:9090/health || exit 1
+    CMD wget -q --spider http://127.0.0.1:9090/health || exit 1
 
 # Run the application
 CMD ["pgmq-relay", "--config", "/etc/pgmq-relay/config.toml"]
