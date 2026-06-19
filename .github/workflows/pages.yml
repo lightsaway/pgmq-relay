@@ -33,7 +33,7 @@ jobs:
           tool: lychee@0.24.2
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Build and check site
         run: make ci-docs
