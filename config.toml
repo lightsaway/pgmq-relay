@@ -64,6 +64,7 @@ retries = 3
 # auto_delete = false
 # delivery_mode = 2            # 1 = transient, 2 = persistent
 # pool_size = 5                # publish channels per worker
+# ack_timeout_ms = 10000        # whole-batch publish/confirm deadline; env: PGMQ_RELAY_RABBITMQ_ACK_TIMEOUT_MS
 
 # --- NATS (uncomment to use) -------------------------------------------------
 # [brokers.my_nats]

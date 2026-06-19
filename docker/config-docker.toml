@@ -26,6 +26,7 @@ type = "rabbitmq"
 url = "amqp://admin:admin@rabbitmq:5672"
 exchange = "pgmq.relay"
 exchange_type = "topic"
+ack_timeout_ms = 10000
 
 [brokers.nats]
 type = "nats"

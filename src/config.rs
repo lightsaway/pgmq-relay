@@ -711,11 +711,25 @@ impl Config {
     fn validate_cross_references(&self) -> Result<(), ConfigValidationError> {
         for queue in &self.queues {
             if let Some(broker_name) = queue.effective_broker_name(self) {
-                if !self.brokers.contains_key(broker_name) {
+                let Some(broker) = self.brokers.get(broker_name) else {
                     return Err(ConfigValidationError::UnknownBroker {
                         queue_name: queue.queue_name.clone(),
                         broker_name: broker_name.to_string(),
                     });
+                };
+
+                if let BrokerConfig::RabbitMQ(rabbitmq) = broker {
+                    let visibility_timeout_ms =
+                        u64::try_from(queue.visibility_timeout_seconds).unwrap_or_default() * 1_000;
+                    if visibility_timeout_ms <= rabbitmq.ack_timeout_ms {
+                        warn!(
+                            queue_name = %queue.queue_name,
+                            broker_name,
+                            visibility_timeout_ms,
+                            ack_timeout_ms = rabbitmq.ack_timeout_ms,
+                            "Queue visibility timeout is not longer than the RabbitMQ acknowledgement timeout; concurrent workers may redeliver messages before the first attempt finishes"
+                        );
+                    }
                 }
             } else {
                 return Err(ConfigValidationError::NoBrokerAvailable {

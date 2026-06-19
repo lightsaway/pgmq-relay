@@ -239,6 +239,7 @@ Any value sourced via these variables is used only when the corresponding TOML f
 | `PGMQ_RELAY_DEFAULT_BATCH_SIZE` | queue `batch_size` |
 | `PGMQ_RELAY_DEFAULT_POLL_INTERVAL` | queue `poll_interval` |
 | `PGMQ_RELAY_DEFAULT_VISIBILITY_TIMEOUT` | queue `visibility_timeout_seconds` |
+| `PGMQ_RELAY_RABBITMQ_ACK_TIMEOUT_MS` | RabbitMQ whole-batch publish/confirm deadline |
 | `PGMQ_RELAY_DEFAULT_MAX_POLL_SECONDS` | queue `max_poll_seconds` |
 | `PGMQ_RELAY_DEFAULT_POLL_INTERVAL_MS` | queue `poll_interval_ms` |
 | `PGMQ_RELAY_DEFAULT_MAX_CONNECTIONS` | `pgmq.max_connections` |
@@ -293,9 +294,10 @@ durable = true
 auto_delete = false
 delivery_mode = 2              # 1 = transient, 2 = persistent
 pool_size = 5                  # publish channels per worker (publisher confirms are pipelined across them)
+ack_timeout_ms = 10000         # whole-batch publish/confirm deadline (100–300000)
 ```
 
-Publisher confirms are always enabled; a message counts as delivered only after RabbitMQ confirms it.
+Publisher confirms are always enabled; a message counts as delivered only after RabbitMQ confirms it. The acknowledgement deadline applies to the whole batch, not each message. Messages still unresolved when it expires remain in PGMQ for retry; because RabbitMQ may have accepted them before the timeout, downstream consumers must tolerate duplicates.
 
 #### NATS (`type = "nats"`)
 

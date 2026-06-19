@@ -3,7 +3,8 @@ use lapin::{
     options::*, types::FieldTable, BasicProperties, Channel, Connection, ConnectionProperties,
 };
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::time::{timeout_at, Instant as TokioInstant};
 use tracing::{debug, error, info, warn};
 
 use crate::broker::{MessageBroker, RelayMessage, SendResult};
@@ -45,6 +46,10 @@ pub struct RabbitMQConfig {
     /// Connection pool size
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+
+    /// Maximum total time spent publishing and waiting for confirms for one batch.
+    #[serde(default = "default_ack_timeout_ms")]
+    pub ack_timeout_ms: u64,
 }
 
 fn default_amqp_url() -> String {
@@ -68,6 +73,15 @@ fn default_pool_size() -> usize {
     5
 }
 
+const DEFAULT_ACK_TIMEOUT_MS: u64 = 10_000;
+
+fn default_ack_timeout_ms() -> u64 {
+    std::env::var("PGMQ_RELAY_RABBITMQ_ACK_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_ACK_TIMEOUT_MS)
+}
+
 impl Default for RabbitMQConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +93,7 @@ impl Default for RabbitMQConfig {
             auto_delete: false,
             delivery_mode: 2,
             pool_size: 5,
+            ack_timeout_ms: default_ack_timeout_ms(),
         }
     }
 }
@@ -95,6 +110,10 @@ impl Validator for RabbitMQConfig {
 
         if self.pool_size == 0 {
             return Err("pool_size must be greater than 0".to_string());
+        }
+
+        if !(100..=300_000).contains(&self.ack_timeout_ms) {
+            return Err("ack_timeout_ms must be between 100 and 300000".to_string());
         }
 
         Ok(())
@@ -233,6 +252,7 @@ impl MessageBroker for RabbitMQBroker {
         }
 
         let start_time = Instant::now();
+        let deadline = TokioInstant::now() + Duration::from_millis(self.config.ack_timeout_ms);
         let mut successful_ids = Vec::new();
         let mut failed_messages = Vec::new();
 
@@ -277,7 +297,7 @@ impl MessageBroker for RabbitMQBroker {
         // confirm futures. Phase 2 awaits the broker confirms. This pipelines confirms
         // across the pool instead of round-tripping per message.
         let mut pending = Vec::with_capacity(messages.len());
-        for message in messages {
+        for (message_index, message) in messages.iter().enumerate() {
             let routing_key = message.key.as_deref().unwrap_or(topic);
             let amqp_headers = Self::convert_headers(&message.headers);
             let properties = BasicProperties::default()
@@ -288,18 +308,20 @@ impl MessageBroker for RabbitMQBroker {
             pool.next = pool.next.wrapping_add(1);
             let channel = &pool.channels[idx];
 
-            match channel
-                .basic_publish(
+            match timeout_at(
+                deadline,
+                channel.basic_publish(
                     &self.config.exchange,
                     routing_key,
                     BasicPublishOptions::default(),
                     &message.payload,
                     properties,
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(confirm) => pending.push((message.id, Some(confirm))),
-                Err(e) => {
+                Ok(Ok(confirm)) => pending.push((message.id, confirm)),
+                Ok(Err(e)) => {
                     error!(
                         broker = %self.name,
                         msg_id = message.id,
@@ -308,17 +330,34 @@ impl MessageBroker for RabbitMQBroker {
                     );
                     failed_messages.push((message.id, format!("Publish failed: {}", e)));
                 }
+                Err(_) => {
+                    warn!(
+                        broker = %self.name,
+                        topic = %topic,
+                        timeout_ms = self.config.ack_timeout_ms,
+                        "RabbitMQ batch publish timed out"
+                    );
+
+                    for (pending_id, _) in pending.drain(..) {
+                        failed_messages
+                            .push((pending_id, "Publisher confirm timed out".to_string()));
+                    }
+                    for unsent in messages.iter().skip(message_index) {
+                        failed_messages.push((
+                            unsent.id,
+                            "RabbitMQ batch acknowledgement deadline exceeded".to_string(),
+                        ));
+                    }
+                    break;
+                }
             }
         }
 
         // Phase 2: await broker confirmations.
-        for (msg_id, confirm) in pending {
-            let confirm = match confirm {
-                Some(c) => c,
-                None => continue,
-            };
-            match confirm.await {
-                Ok(confirmation) if confirmation.is_nack() => {
+        let mut pending = pending.into_iter();
+        while let Some((msg_id, confirm)) = pending.next() {
+            match timeout_at(deadline, confirm).await {
+                Ok(Ok(confirmation)) if confirmation.is_nack() => {
                     error!(
                         broker = %self.name,
                         msg_id = msg_id,
@@ -326,10 +365,10 @@ impl MessageBroker for RabbitMQBroker {
                     );
                     failed_messages.push((msg_id, "Message nack'd by broker".to_string()));
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     successful_ids.push(msg_id);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(
                         broker = %self.name,
                         msg_id = msg_id,
@@ -337,6 +376,19 @@ impl MessageBroker for RabbitMQBroker {
                         "Failed to confirm message"
                     );
                     failed_messages.push((msg_id, format!("Confirmation failed: {}", e)));
+                }
+                Err(_) => {
+                    warn!(
+                        broker = %self.name,
+                        topic = %topic,
+                        timeout_ms = self.config.ack_timeout_ms,
+                        "RabbitMQ publisher confirm timed out"
+                    );
+                    failed_messages.push((msg_id, "Publisher confirm timed out".to_string()));
+                    failed_messages.extend(pending.map(|(pending_id, _)| {
+                        (pending_id, "Publisher confirm timed out".to_string())
+                    }));
+                    break;
                 }
             }
         }
@@ -377,5 +429,36 @@ impl MessageBroker for RabbitMQBroker {
                 self.name
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_ack_timeout_is_ten_seconds() {
+        assert_eq!(DEFAULT_ACK_TIMEOUT_MS, 10_000);
+    }
+
+    #[test]
+    fn validates_ack_timeout_range() {
+        let below_minimum = RabbitMQConfig {
+            ack_timeout_ms: 99,
+            ..Default::default()
+        };
+        assert!(below_minimum.validate().is_err());
+
+        let minimum = RabbitMQConfig {
+            ack_timeout_ms: 100,
+            ..Default::default()
+        };
+        assert!(minimum.validate().is_ok());
+
+        let above_maximum = RabbitMQConfig {
+            ack_timeout_ms: 300_001,
+            ..Default::default()
+        };
+        assert!(above_maximum.validate().is_err());
     }
 }
