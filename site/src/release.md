@@ -41,18 +41,33 @@ After the first image is published, set the GHCR package visibility appropriate 
 3. Validate the intended tag:
 
    ```bash
-   make release-validate TAG=v0.1.0
+   make release-validate TAG=v0.1.1
    ```
 
 4. Commit and merge the version change.
-5. Create a tag that exactly matches the Cargo version:
+5. Create a tag derived from the Cargo version and push it:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   make release-tag
+   git push origin v0.1.1
    ```
 
-The workflow rejects a tag whose value does not equal `v` plus the `Cargo.toml` version.
+Pushing a tag alone is sufficient only when the tagged commit already contains
+the matching version in `Cargo.toml`. The workflow rejects mismatches because
+otherwise the release tag, archive names, container tags, and compiled binary
+would disagree.
+
+If a mismatched tag was already pushed and the workflow failed, first commit
+the corrected Cargo version. Then replace the failed tag:
+
+```bash
+git tag -d v0.1.1
+git push origin :refs/tags/v0.1.1
+make release-tag
+git push origin v0.1.1
+```
+
+Do not move a tag after a successful release has published artifacts.
 
 ## Published artifacts
 

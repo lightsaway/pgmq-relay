@@ -10,7 +10,7 @@ TARGET_ARG = $(if $(TARGET),--target $(TARGET),)
 .PHONY: help build build-release check fmt fmt-check clippy test clean \
 	docker-build docker-run docker-stop docker-compose-up docker-compose-down \
 	docker-compose-logs site site-check site-serve security-audit \
-	ci-quality ci-test ci-docs ci-audit ci-check
+	release-tag ci-quality ci-test ci-docs ci-audit ci-check
 
 # Default target
 help: ## Show this help message
@@ -210,6 +210,16 @@ release-validate: ## Verify TAG matches the Cargo package version
 		echo "Tag $(TAG) does not match Cargo.toml version v$$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"; \
 		exit 1; \
 	}
+
+release-tag: ## Create a local release tag from the Cargo package version
+	@git diff --quiet && git diff --cached --quiet || { \
+		echo "Working tree has tracked changes; commit them before tagging"; \
+		exit 1; \
+	}
+	@tag="v$$($(MAKE) --no-print-directory version)"; \
+	$(MAKE) --no-print-directory release-validate TAG="$$tag"; \
+	git tag "$$tag"; \
+	echo "Created $$tag; push it with: git push origin $$tag"
 
 # CI/CD helpers
 ci-quality: fmt-check clippy ## Run formatting and lint checks used by CI
