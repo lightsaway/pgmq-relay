@@ -56,8 +56,9 @@ jobs:
             build-essential cmake pkg-config perl libsasl2-dev \
             libcurl4-openssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.96.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
