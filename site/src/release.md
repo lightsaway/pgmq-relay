@@ -29,8 +29,7 @@ After the first image is published, set the GHCR package visibility appropriate 
 
 ## Release checklist
 
-1. Update `version` in `Cargo.toml`.
-2. Run the local checks:
+1. Run the local checks:
 
    ```bash
    make ci-check
@@ -38,24 +37,31 @@ After the first image is published, set the GHCR package visibility appropriate 
    make docker-build
    ```
 
-3. Validate the intended tag:
+2. Create the next patch-version commit and matching tag:
 
    ```bash
-   make release-validate TAG=v0.1.1
+   make create-next-tag
    ```
 
-4. Commit and merge the version change.
-5. Create a tag derived from the Cargo version and push it:
+   To select a minor, major, or prerelease version explicitly:
 
    ```bash
-   make release-tag
-   git push origin v0.1.1
+   make create-next-tag VERSION=0.2.0
    ```
 
-Pushing a tag alone is sufficient only when the tagged commit already contains
-the matching version in `Cargo.toml`. The workflow rejects mismatches because
-otherwise the release tag, archive names, container tags, and compiled binary
-would disagree.
+   The target requires a clean tracked worktree, updates `Cargo.toml` and
+   `Cargo.lock`, runs a locked Cargo check, commits the version change, and
+   creates the matching local tag.
+
+3. Push the release commit and tag:
+
+   ```bash
+   git push origin HEAD v0.1.2
+   ```
+
+The workflow rejects a tag whose commit does not contain the same version in
+`Cargo.toml`. This prevents the release tag, archive names, container tags, and
+compiled binary from disagreeing.
 
 If a mismatched tag was already pushed and the workflow failed, first commit
 the corrected Cargo version. Then replace the failed tag:

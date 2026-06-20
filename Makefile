@@ -10,7 +10,7 @@ TARGET_ARG = $(if $(TARGET),--target $(TARGET),)
 .PHONY: help build build-release check fmt fmt-check clippy test clean \
 	docker-build docker-run docker-stop docker-compose-up docker-compose-down \
 	docker-compose-logs site site-check site-serve security-audit \
-	release-tag ci-quality ci-test ci-docs ci-audit ci-check
+	create-next-tag release-tag ci-quality ci-test ci-docs ci-audit ci-check
 
 # Default target
 help: ## Show this help message
@@ -220,6 +220,9 @@ release-tag: ## Create a local release tag from the Cargo package version
 	$(MAKE) --no-print-directory release-validate TAG="$$tag"; \
 	git tag "$$tag"; \
 	echo "Created $$tag; push it with: git push origin $$tag"
+
+create-next-tag: ## Bump patch version, commit it, and create the matching tag
+	@VERSION="$(VERSION)" ./scripts/create-next-tag.sh
 
 # CI/CD helpers
 ci-quality: fmt-check clippy ## Run formatting and lint checks used by CI
