@@ -3,6 +3,8 @@
 # Build stage - use Alpine for minimal image size
 FROM rust:1.96-alpine AS builder
 
+ARG TARGETARCH
+
 # Install build dependencies
 RUN apk add --no-cache \
     pkgconfig \
@@ -29,7 +31,7 @@ ENV OPENSSL_STATIC=1
 COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/pgmq-relay/target \
+    --mount=type=cache,id=pgmq-relay-target-${TARGETARCH},target=/usr/src/pgmq-relay/target \
     mkdir src \
     && printf 'fn main() {}\n' > src/main.rs \
     && printf '' > src/lib.rs \
@@ -41,7 +43,7 @@ COPY src ./src
 # Build the application with release optimizations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/pgmq-relay/target \
+    --mount=type=cache,id=pgmq-relay-target-${TARGETARCH},target=/usr/src/pgmq-relay/target \
     cargo clean --release -p pgmq-relay \
     && cargo build --release --locked \
     && cp target/release/pgmq-relay /tmp/pgmq-relay
