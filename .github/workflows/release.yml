@@ -127,7 +127,9 @@ jobs:
 
   docker:
     name: Docker image
-    needs: validate
+    needs:
+      - validate
+      - binaries
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,6 +138,41 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v7
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*-unknown-linux-gnu
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Prepare release image context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          (
+            cd release-artifacts
+            sha256sum --check *.sha256
+          )
+
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            case "$target" in
+              x86_64-unknown-linux-gnu) arch=amd64 ;;
+              aarch64-unknown-linux-gnu) arch=arm64 ;;
+            esac
+
+            archive=$(find release-artifacts -name "*-${target}.tar.gz" -print -quit)
+            test -n "$archive"
+
+            extract_dir=$(mktemp -d)
+            tar -xzf "$archive" -C "$extract_dir"
+            binary=$(find "$extract_dir" -type f -name pgmq-relay -print -quit)
+            test -n "$binary"
+
+            mkdir -p "release-context/$arch"
+            install -m 0755 "$binary" "release-context/$arch/pgmq-relay"
+          done
 
       - uses: docker/setup-qemu-action@v3
 
@@ -164,6 +201,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

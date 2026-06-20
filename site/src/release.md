@@ -104,3 +104,10 @@ ghcr.io/lightsaway/pgmq-relay:latest
 `latest` is updated only by stable SemVer releases. A prerelease such as `v0.2.0-rc.1` publishes `0.2.0-rc.1` without replacing `latest`.
 
 If the Docker job fails, the GitHub Release is not created because the publish job depends on every binary and image job.
+
+The release image reuses the Linux binaries produced by the release matrix.
+The regular `Dockerfile` still builds the application from source for local
+and standalone Docker builds. The release image uses a minimal `scratch`
+runtime containing only the application, its shared libraries, CA
+certificates, and configuration. Health checks for that image should probe
+`/health` from the orchestrator because the image has no shell or HTTP client.
