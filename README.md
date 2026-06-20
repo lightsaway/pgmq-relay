@@ -13,6 +13,38 @@ It is designed for transactional-outbox and queue-bridging workloads that need:
 
 Full documentation: <https://lightsaway.github.io/pgmq-relay/>
 
+## Architecture
+
+```mermaid
+flowchart LR
+    PGMQ[(PostgreSQL + PGMQ)]
+    Supervisor[Relay supervisor]
+    Workers[Queue workers]
+    Transform[Transform and validate]
+    Broker{Destination broker}
+    Kafka[Kafka]
+    RabbitMQ[RabbitMQ]
+    NATS[NATS / JetStream]
+    Complete[Delete or archive]
+    DLQ[Transformation DLQ]
+
+    Supervisor -->|owns lifecycle| Workers
+    PGMQ -->|fetch batch| Workers
+    Workers --> Transform
+    Transform -->|valid messages| Broker
+    Transform -->|invalid messages| DLQ
+    Broker --> Kafka
+    Broker --> RabbitMQ
+    Broker --> NATS
+    Kafka -->|acknowledged IDs| Complete
+    RabbitMQ -->|publisher confirms| Complete
+    NATS -->|server acknowledgement| Complete
+    Complete --> PGMQ
+```
+
+Workers are supervised service tasks. Source messages are completed only after
+the destination broker acknowledges them, except in destructive `pop` mode.
+
 ## Delivery model
 
 The relay publishes a message before deleting or archiving it in PGMQ. A crash between broker acknowledgement and PGMQ completion causes redelivery, so downstream consumers must be idempotent.
