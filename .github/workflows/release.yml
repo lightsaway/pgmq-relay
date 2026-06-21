@@ -29,10 +29,6 @@ jobs:
     name: Build documentation
     needs: validate
     runs-on: ubuntu-slim
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v7
 
@@ -44,14 +40,8 @@ jobs:
         with:
           tool: lychee@0.24.2
 
-      - uses: actions/configure-pages@v6
-
       - name: Build and check site
         run: make ci-docs
-
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: book
 
   binaries:
     name: Binary (${{ matrix.target }})
@@ -250,22 +240,17 @@ jobs:
             dist/*.tar.gz.sha256
             dist/SHA256SUMS
 
-  deploy-docs:
-    name: Publish documentation
+  dispatch-docs:
+    name: Update documentation
     needs:
       - docs
       - publish
     runs-on: ubuntu-latest
-    concurrency:
-      group: pages
-      cancel-in-progress: false
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      actions: write
+      contents: read
     steps:
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v5
+      - name: Dispatch Pages workflow from main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run pages.yml --ref main
