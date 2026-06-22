@@ -1,5 +1,8 @@
 # PGMQ Relay
 
+[![CI](https://github.com/lightsaway/pgmq-relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lightsaway/pgmq-relay/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/lightsaway/pgmq-relay?display_name=tag&sort=semver)](https://github.com/lightsaway/pgmq-relay/releases/latest)
+
 PGMQ Relay moves messages from PostgreSQL queues managed by [PGMQ](https://github.com/pgmq/pgmq) to Kafka, RabbitMQ, or NATS.
 
 It is designed for transactional-outbox and queue-bridging workloads that need:
