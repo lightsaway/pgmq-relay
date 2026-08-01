@@ -23,12 +23,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install mdBook
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.4
         with:
           tool: mdbook@0.5.3
 
       - name: Install link checker
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.4
         with:
           tool: lychee@0.24.2
 
