@@ -34,7 +34,7 @@ pub struct NatsConfig {
     #[serde(default = "default_reconnect_delay_ms")]
     pub reconnect_delay_ms: u64,
 
-    #[serde(default)]
+    #[serde(default = "default_jetstream_enabled")]
     pub jetstream_enabled: bool,
 
     #[serde(default)]
@@ -54,12 +54,23 @@ fn default_client_name() -> String {
     "pgmq-relay".to_string()
 }
 
+// Unlimited: once max_reconnects is exhausted the async-nats client closes permanently
+// and every publish fails until process restart, so a bounded default turns any outage
+// longer than the reconnect budget into a wedged worker. Health checks report the
+// disconnected state in the meantime.
 fn default_max_reconnects() -> usize {
-    60 // Retry for ~5 minutes with default delay
+    0 // 0 = reconnect forever
 }
 
 fn default_reconnect_delay_ms() -> u64 {
     5000 // 5 seconds
+}
+
+// JetStream publishes get a durable server acknowledgement before a message is deleted
+// from PGMQ. Core NATS is fire-and-forget (flush only proves the server received the
+// bytes), so making it the default would silently violate at-least-once delivery.
+fn default_jetstream_enabled() -> bool {
+    true
 }
 
 fn reconnect_delay(base_delay_ms: u64, attempts: usize) -> Duration {
@@ -78,7 +89,7 @@ impl Default for NatsConfig {
             client_name: default_client_name(),
             max_reconnects: default_max_reconnects(),
             reconnect_delay_ms: default_reconnect_delay_ms(),
-            jetstream_enabled: false,
+            jetstream_enabled: default_jetstream_enabled(),
             jetstream_domain: None,
             use_key_as_subject_suffix: false,
         }
@@ -99,6 +110,14 @@ impl Validator for NatsConfig {
             return Err("client_name cannot be empty".to_string());
         }
 
+        if !self.jetstream_enabled {
+            warn!(
+                "NATS jetstream_enabled=false: core NATS publishes carry no server \
+                 acknowledgement, so messages can be silently lost (no subscriber, server \
+                 restart). Only use this if downstream loss is acceptable."
+            );
+        }
+
         Ok(())
     }
 }
@@ -113,7 +132,11 @@ pub struct NatsBroker {
 impl NatsBroker {
     /// Create a new NATS broker
     pub async fn new(name: &str, config: &NatsConfig) -> Result<Self, RelayError> {
-        info!("Creating NATS broker '{}' with URL: {}", name, config.url);
+        info!(
+            "Creating NATS broker '{}' with URL: {}",
+            name,
+            crate::logging::redact_url(&config.url)
+        );
 
         let servers: Vec<String> = config
             .url
@@ -175,7 +198,10 @@ impl NatsBroker {
                 ))
             })?;
 
-        info!("Connected to NATS server(s): {}", config.url);
+        info!(
+            "Connected to NATS server(s): {}",
+            crate::logging::redact_url(&config.url)
+        );
 
         let jetstream = if config.jetstream_enabled {
             let js_context = if let Some(ref domain) = config.jetstream_domain {
@@ -390,6 +416,26 @@ impl MessageBroker for NatsBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_favor_durable_delivery() {
+        let config = NatsConfig::default();
+        // JetStream by default: core NATS has no server acknowledgement, so it must be
+        // an explicit opt-in rather than the silent default.
+        assert!(config.jetstream_enabled);
+        // Reconnect forever: a bounded budget permanently kills the client after a long
+        // outage, requiring a process restart.
+        assert_eq!(config.max_reconnects, 0);
+    }
+
+    #[test]
+    fn jetstream_can_be_explicitly_disabled() {
+        let config: NatsConfig =
+            toml::from_str("url = \"nats://localhost:4222\"\njetstream_enabled = false")
+                .expect("config should parse");
+        assert!(!config.jetstream_enabled);
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn reconnect_backoff_starts_at_base_delay_and_is_capped() {

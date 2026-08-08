@@ -253,4 +253,6 @@ jobs:
       - name: Dispatch Pages workflow from main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run pages.yml --ref main
+        # --repo is required: this job runs without a checkout, and gh otherwise fails
+        # with "not a git repository" (which failed the tail of every release).
+        run: gh workflow run pages.yml --ref main --repo "${GITHUB_REPOSITORY}"

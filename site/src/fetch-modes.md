@@ -21,7 +21,7 @@ Fetch mode controls which PGMQ function a worker calls.
 - Use `read_grouped` when draining one available group efficiently is desirable.
 - Use `read_grouped_rr` for multi-tenant fairness across groups.
 - Use `read_grouped_head` to expose concurrency across many groups while taking one head message from each.
-- Use `pop` only for explicitly disposable events.
+- Use `pop` only for explicitly disposable events. Pop queues must configure a `dead_letter_queue` (validation enforces it) so messages that fail transformation or broker delivery are preserved.
 
 ## Long-poll settings
 

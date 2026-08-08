@@ -69,26 +69,87 @@ impl Default for KafkaConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum KafkaTransactionConfig {
     /// Disable transactions - higher throughput, at-least-once delivery
-    Disabled(bool), // false
+    Disabled,
 
     /// Enable transactions with configuration
     Enabled {
         /// Transactional ID generation strategy
-        #[serde(default)]
         strategy: TransactionalIdStrategy,
 
         /// Transaction timeout in milliseconds (default: 60000ms)
-        #[serde(default = "default_transaction_timeout")]
         timeout_ms: u32,
 
-        /// Maximum number of retries for transactional operations
-        #[serde(default = "default_transaction_retries")]
+        /// Retained for backward compatibility; no longer mapped to librdkafka's
+        /// `retries` (idempotent producers manage send retries themselves, bounded
+        /// by `message.timeout.ms`).
         retries: u32,
     },
+}
+
+/// Accepts either a bare boolean (`transactions = true` / `false`) or a settings table.
+/// A hand-written impl because `#[serde(untagged)]` with a `Disabled(bool)` variant
+/// listed first captured *every* boolean — including `true` — silently disabling
+/// transactions for operators who wrote `transactions = true` to enable them.
+impl<'de> Deserialize<'de> for KafkaTransactionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawTransactionConfig {
+            Flag(bool),
+            Settings {
+                #[serde(default)]
+                strategy: TransactionalIdStrategy,
+                #[serde(default = "default_transaction_timeout")]
+                timeout_ms: u32,
+                #[serde(default = "default_transaction_retries")]
+                retries: u32,
+            },
+        }
+
+        Ok(match RawTransactionConfig::deserialize(deserializer)? {
+            RawTransactionConfig::Flag(false) => KafkaTransactionConfig::Disabled,
+            RawTransactionConfig::Flag(true) => KafkaTransactionConfig::default(),
+            RawTransactionConfig::Settings {
+                strategy,
+                timeout_ms,
+                retries,
+            } => KafkaTransactionConfig::Enabled {
+                strategy,
+                timeout_ms,
+                retries,
+            },
+        })
+    }
+}
+
+impl Serialize for KafkaTransactionConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        match self {
+            KafkaTransactionConfig::Disabled => serializer.serialize_bool(false),
+            KafkaTransactionConfig::Enabled {
+                strategy,
+                timeout_ms,
+                retries,
+            } => {
+                let mut state = serializer.serialize_struct("KafkaTransactionConfig", 3)?;
+                state.serialize_field("strategy", strategy)?;
+                state.serialize_field("timeout_ms", timeout_ms)?;
+                state.serialize_field("retries", retries)?;
+                state.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,21 +201,14 @@ impl KafkaTransactionConfig {
     pub fn get_strategy(&self) -> Option<&TransactionalIdStrategy> {
         match self {
             KafkaTransactionConfig::Enabled { strategy, .. } => Some(strategy),
-            KafkaTransactionConfig::Disabled(_) => None,
+            KafkaTransactionConfig::Disabled => None,
         }
     }
 
     pub fn get_timeout_ms(&self) -> u32 {
         match self {
             KafkaTransactionConfig::Enabled { timeout_ms, .. } => *timeout_ms,
-            KafkaTransactionConfig::Disabled(_) => 0,
-        }
-    }
-
-    pub fn get_retries(&self) -> u32 {
-        match self {
-            KafkaTransactionConfig::Enabled { retries, .. } => *retries,
-            KafkaTransactionConfig::Disabled(_) => 0,
+            KafkaTransactionConfig::Disabled => 0,
         }
     }
 }
@@ -256,14 +310,203 @@ impl Validator for KafkaConfig {
 }
 
 pub struct KafkaBroker {
-    producer: FutureProducer,
+    /// Guarded so the producer can be rebuilt in place after a fatal error (e.g. this
+    /// producer was fenced by another instance with the same transactional.id). Reads
+    /// clone the producer (cheap: it is an Arc internally) and never hold the lock
+    /// across a send.
+    producer: tokio::sync::RwLock<FutureProducer>,
     supports_transactions: bool,
+    config: KafkaConfig,
+    instance_id: String,
+}
+
+const KAFKA_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// True when the error means the current transaction must be aborted but the producer
+/// itself is still usable for the next transaction.
+fn requires_transaction_abort(error: &rdkafka::error::KafkaError) -> bool {
+    matches!(error, rdkafka::error::KafkaError::Transaction(e) if e.txn_requires_abort())
+}
+
+/// Build (and for transactional configs, initialize) a producer. Blocking: call via
+/// `spawn_blocking` — `init_transactions` can stall for up to its full timeout.
+fn build_producer(config: &KafkaConfig, instance_id: &str) -> Result<FutureProducer, RelayError> {
+    let mut client_config = ClientConfig::new();
+
+    client_config.set("bootstrap.servers", &config.bootstrap_servers);
+    client_config.set("message.timeout.ms", "30000");
+    client_config.set("queue.buffering.max.messages", "100000");
+    client_config.set("queue.buffering.max.kbytes", "1048576");
+    client_config.set("batch.num.messages", "1000");
+
+    if config.transactions.is_enabled() {
+        let unique_tx_id = if let Some(strategy) = config.transactions.get_strategy() {
+            strategy.generate_id(instance_id)
+        } else {
+            // Fallback (should not happen due to default)
+            format!("pgmq-relay-{}", sanitize_for_tx_id(instance_id))
+        };
+
+        client_config.set("transactional.id", &unique_tx_id);
+        client_config.set(
+            "transaction.timeout.ms",
+            config.transactions.get_timeout_ms().to_string(),
+        );
+        // Deliberately not setting `retries`: for an idempotent producer librdkafka's
+        // default is effectively unlimited, bounded by message.timeout.ms. Pinning it
+        // low would fail whole transactional batches on routine leader elections.
+        client_config.set("enable.idempotence", "true");
+        client_config.set("max.in.flight.requests.per.connection", "5");
+        client_config.set("acks", "all");
+
+        info!(
+            "Kafka transactions enabled with transactional.id: {}",
+            unique_tx_id
+        );
+    } else {
+        info!("Kafka transactions disabled - using at-least-once delivery");
+    }
+
+    if let Some(ref protocol) = config.security_protocol {
+        client_config.set("security.protocol", protocol);
+    }
+
+    if let Some(ref mechanism) = config.sasl_mechanism {
+        client_config.set("sasl.mechanism", mechanism);
+    }
+
+    if let Some(ref username) = config.sasl_username {
+        client_config.set("sasl.username", username);
+    }
+
+    if let Some(ref password) = config.sasl_password {
+        client_config.set("sasl.password", password);
+    }
+
+    if let Some(ref ca_location) = config.ssl_ca_location {
+        client_config.set("ssl.ca.location", ca_location);
+    }
+
+    if let Some(ref cert_location) = config.ssl_certificate_location {
+        client_config.set("ssl.certificate.location", cert_location);
+    }
+
+    if let Some(ref key_location) = config.ssl_key_location {
+        client_config.set("ssl.key.location", key_location);
+    }
+
+    for (key, value) in &config.additional_config {
+        client_config.set(key, value);
+    }
+
+    let producer: FutureProducer = client_config
+        .create()
+        .map_err(|e| RelayError::BrokerConfiguration(e.to_string()))?;
+
+    if config.transactions.is_enabled() {
+        info!("Initializing Kafka transactions...");
+        producer
+            .init_transactions(Timeout::After(KAFKA_OPERATION_TIMEOUT))
+            .map_err(|e| {
+                RelayError::BrokerConfiguration(format!(
+                    "Failed to initialize Kafka transactions: {}",
+                    e
+                ))
+            })?;
+        info!("Kafka transactions initialized successfully");
+    }
+
+    Ok(producer)
 }
 
 impl KafkaBroker {
+    pub async fn new(
+        _name: &str,
+        config: &KafkaConfig,
+        instance_id: &str,
+    ) -> Result<Self, RelayError> {
+        let supports_transactions = config.transactions.is_enabled();
+        let producer =
+            Self::build_producer_blocking(config.clone(), instance_id.to_string()).await?;
+
+        Ok(Self {
+            producer: tokio::sync::RwLock::new(producer),
+            supports_transactions,
+            config: config.clone(),
+            instance_id: instance_id.to_string(),
+        })
+    }
+
+    /// Run `build_producer` on the blocking thread pool so `init_transactions` cannot
+    /// stall an async executor thread.
+    async fn build_producer_blocking(
+        config: KafkaConfig,
+        instance_id: String,
+    ) -> Result<FutureProducer, RelayError> {
+        tokio::task::spawn_blocking(move || build_producer(&config, &instance_id))
+            .await
+            .map_err(|e| {
+                RelayError::BrokerConfiguration(format!("Kafka producer build task failed: {}", e))
+            })?
+    }
+
+    /// Replace a fatally-broken producer with a fresh one. Without this, a fenced
+    /// producer would fail every batch until process restart while health checks
+    /// (metadata fetch) kept passing.
+    async fn rebuild_producer(&self) -> Result<(), RelayError> {
+        warn!("Rebuilding Kafka producer after fatal error");
+        let new_producer =
+            Self::build_producer_blocking(self.config.clone(), self.instance_id.clone()).await?;
+        *self.producer.write().await = new_producer;
+        info!("Kafka producer rebuilt successfully");
+        Ok(())
+    }
+
+    async fn current_producer(&self) -> FutureProducer {
+        self.producer.read().await.clone()
+    }
+
+    /// Commit the in-flight transaction on the blocking pool (librdkafka blocks for up
+    /// to the timeout).
+    async fn commit_transaction_blocking(
+        producer: &FutureProducer,
+    ) -> Result<(), rdkafka::error::KafkaError> {
+        let producer = producer.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            producer.commit_transaction(Timeout::After(KAFKA_OPERATION_TIMEOUT))
+        });
+        match handle.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                error!("Kafka commit task failed to run: {}", join_error);
+                Err(rdkafka::error::KafkaError::Canceled)
+            }
+        }
+    }
+
+    async fn abort_transaction_blocking(
+        producer: &FutureProducer,
+    ) -> Result<(), rdkafka::error::KafkaError> {
+        let producer = producer.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            producer.abort_transaction(Timeout::After(KAFKA_OPERATION_TIMEOUT))
+        });
+        match handle.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                error!("Kafka abort task failed to run: {}", join_error);
+                Err(rdkafka::error::KafkaError::Canceled)
+            }
+        }
+    }
+
     /// Execute a function within a Kafka transaction
     /// If transactions aren't supported, just executes the function
-    async fn with_transaction<F, Fut, T>(&self, f: F) -> Result<T, RelayError>
+    async fn with_transaction<F, Fut, T>(
+        &self,
+        producer: &FutureProducer,
+        f: F,
+    ) -> Result<T, RelayError>
     where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<T, RelayError>> + Send,
@@ -274,7 +517,7 @@ impl KafkaBroker {
         }
 
         tracing::trace!("Beginning Kafka transaction");
-        self.producer
+        producer
             .begin_transaction()
             .map_err(|e| RelayError::BrokerSend(format!("Failed to begin transaction: {}", e)))?;
 
@@ -283,121 +526,41 @@ impl KafkaBroker {
         match result {
             Ok(value) => {
                 tracing::trace!("Committing Kafka transaction");
-                self.producer
-                    .commit_transaction(Timeout::After(Duration::from_secs(30)))
-                    .map_err(|e| {
-                        error!("Failed to commit transaction: {}", e);
-                        RelayError::BrokerSend(format!("Failed to commit transaction: {}", e))
-                    })?;
-                info!("Kafka transaction committed successfully");
-                Ok(value)
+                match Self::commit_transaction_blocking(producer).await {
+                    Ok(()) => {
+                        debug!("Kafka transaction committed successfully");
+                        Ok(value)
+                    }
+                    Err(commit_error) if requires_transaction_abort(&commit_error) => {
+                        warn!(
+                            "Kafka commit failed with abortable error, aborting transaction: {}",
+                            commit_error
+                        );
+                        if let Err(abort_error) = Self::abort_transaction_blocking(producer).await {
+                            error!("Failed to abort Kafka transaction: {}", abort_error);
+                        }
+                        Err(RelayError::BrokerSend(format!(
+                            "Failed to commit transaction: {}",
+                            commit_error
+                        )))
+                    }
+                    Err(commit_error) => {
+                        error!("Failed to commit transaction: {}", commit_error);
+                        Err(RelayError::BrokerSend(format!(
+                            "Failed to commit transaction: {}",
+                            commit_error
+                        )))
+                    }
+                }
             }
             Err(e) => {
                 warn!("Operation failed, aborting Kafka transaction: {}", e);
-                if let Err(abort_err) = self
-                    .producer
-                    .abort_transaction(Timeout::After(Duration::from_secs(30)))
-                {
-                    error!("Failed to abort Kafka transaction: {}", abort_err);
+                if let Err(abort_error) = Self::abort_transaction_blocking(producer).await {
+                    error!("Failed to abort Kafka transaction: {}", abort_error);
                 }
                 Err(e)
             }
         }
-    }
-
-    pub fn new(_name: &str, config: &KafkaConfig, instance_id: &str) -> Result<Self, RelayError> {
-        let (producer, supports_transactions) = {
-            let mut client_config = ClientConfig::new();
-
-            client_config.set("bootstrap.servers", &config.bootstrap_servers);
-            client_config.set("message.timeout.ms", "30000");
-            client_config.set("queue.buffering.max.messages", "100000");
-            client_config.set("queue.buffering.max.kbytes", "1048576");
-            client_config.set("batch.num.messages", "1000");
-
-            let supports_transactions = config.transactions.is_enabled();
-            if supports_transactions {
-                let unique_tx_id = if let Some(strategy) = config.transactions.get_strategy() {
-                    strategy.generate_id(instance_id)
-                } else {
-                    // Fallback (should not happen due to default)
-                    format!("pgmq-relay-{}", sanitize_for_tx_id(instance_id))
-                };
-
-                client_config.set("transactional.id", &unique_tx_id);
-                client_config.set(
-                    "transaction.timeout.ms",
-                    config.transactions.get_timeout_ms().to_string(),
-                );
-                client_config.set("retries", config.transactions.get_retries().to_string());
-                client_config.set("enable.idempotence", "true");
-                client_config.set("max.in.flight.requests.per.connection", "5");
-                client_config.set("acks", "all");
-
-                info!(
-                    "Kafka transactions enabled with transactional.id: {}",
-                    unique_tx_id
-                );
-            } else {
-                info!("Kafka transactions disabled - using at-least-once delivery");
-            }
-
-            if let Some(ref protocol) = config.security_protocol {
-                client_config.set("security.protocol", protocol);
-            }
-
-            if let Some(ref mechanism) = config.sasl_mechanism {
-                client_config.set("sasl.mechanism", mechanism);
-            }
-
-            if let Some(ref username) = config.sasl_username {
-                client_config.set("sasl.username", username);
-            }
-
-            if let Some(ref password) = config.sasl_password {
-                client_config.set("sasl.password", password);
-            }
-
-            if let Some(ref ca_location) = config.ssl_ca_location {
-                client_config.set("ssl.ca.location", ca_location);
-            }
-
-            if let Some(ref cert_location) = config.ssl_certificate_location {
-                client_config.set("ssl.certificate.location", cert_location);
-            }
-
-            if let Some(ref key_location) = config.ssl_key_location {
-                client_config.set("ssl.key.location", key_location);
-            }
-
-            for (key, value) in &config.additional_config {
-                client_config.set(key, value);
-            }
-
-            let producer: FutureProducer = client_config
-                .create()
-                .map_err(|e| RelayError::BrokerConfiguration(e.to_string()))?;
-
-            if supports_transactions {
-                info!("Initializing Kafka transactions...");
-                producer
-                    .init_transactions(Timeout::After(Duration::from_secs(30)))
-                    .map_err(|e| {
-                        RelayError::BrokerConfiguration(format!(
-                            "Failed to initialize Kafka transactions: {}",
-                            e
-                        ))
-                    })?;
-                info!("Kafka transactions initialized successfully");
-            }
-
-            (producer, supports_transactions)
-        };
-
-        Ok(Self {
-            producer,
-            supports_transactions,
-        })
     }
 }
 
@@ -416,10 +579,12 @@ impl MessageBroker for KafkaBroker {
         }
 
         let message_count = messages.len();
-        info!("Sending {} messages to topic '{}'", message_count, topic);
+        debug!("Sending {} messages to topic '{}'", message_count, topic);
 
+        let producer = self.current_producer().await;
+        let send_producer = producer.clone();
         let result = self
-            .with_transaction(|| {
+            .with_transaction(&producer, move || {
                 let messages_clone = messages.to_vec();
                 let topic_clone = topic.to_string();
                 async move {
@@ -463,9 +628,8 @@ impl MessageBroker for KafkaBroker {
                             message.headers.keys().collect::<Vec<_>>()
                         );
 
-                        let future = self
-                            .producer
-                            .send(record, Timeout::After(Duration::from_secs(30)));
+                        let future =
+                            send_producer.send(record, Timeout::After(Duration::from_secs(30)));
 
                         futures.push((message.id, future));
                     }
@@ -475,7 +639,7 @@ impl MessageBroker for KafkaBroker {
 
                     for (msg_id, future) in futures {
                         match future.await {
-                            Ok((_partition, _offset)) => {
+                            Ok(_delivery) => {
                                 successful_message_ids.push(msg_id);
                                 success_count += 1;
                             }
@@ -530,9 +694,21 @@ impl MessageBroker for KafkaBroker {
             Err(e) => {
                 warn!("Failed to send messages to topic '{}': {}", topic, e);
 
+                // A fatal producer error (e.g. fenced by another instance with the same
+                // transactional.id) breaks every future send on this producer. Rebuild it
+                // now; if that fails, propagate the error so the worker surfaces a real
+                // failure instead of silently reporting failed batches forever.
+                if producer.client().fatal_error().is_some() {
+                    error!(
+                        "Kafka producer hit a fatal error - rebuilding producer for topic '{}'",
+                        topic
+                    );
+                    self.rebuild_producer().await?;
+                }
+
                 let all_failed: Vec<(i64, String)> = messages
                     .iter()
-                    .map(|m| (m.id, "Transaction failed".to_string()))
+                    .map(|m| (m.id, format!("Transaction failed: {}", e)))
                     .collect();
 
                 Ok(SendResult {
@@ -544,14 +720,32 @@ impl MessageBroker for KafkaBroker {
     }
 
     async fn health_check(&self) -> Result<(), RelayError> {
-        let metadata_result = self
-            .producer
-            .client()
-            .fetch_metadata(None, Timeout::After(Duration::from_secs(10)));
+        let producer = self.current_producer().await;
+
+        // A producer with a fatal error can still fetch metadata, so check it explicitly
+        // or a fenced producer would report healthy while failing every send.
+        if let Some((error_code, reason)) = producer.client().fatal_error() {
+            return Err(RelayError::BrokerHealthCheck(format!(
+                "Kafka producer has a fatal error ({:?}): {}",
+                error_code, reason
+            )));
+        }
+
+        // fetch_metadata is a blocking librdkafka call (up to its full timeout when the
+        // cluster is unreachable), so keep it off the async executor threads.
+        let handle = tokio::task::spawn_blocking(move || {
+            producer
+                .client()
+                .fetch_metadata(None, Timeout::After(Duration::from_secs(10)))
+                .map(|metadata| metadata.brokers().len())
+        });
+        let metadata_result = handle.await.map_err(|e| {
+            RelayError::BrokerHealthCheck(format!("Kafka health check task failed: {}", e))
+        })?;
 
         match metadata_result {
-            Ok(metadata) => {
-                if metadata.brokers().is_empty() {
+            Ok(broker_count) => {
+                if broker_count == 0 {
                     return Err(RelayError::BrokerHealthCheck(
                         "No Kafka brokers available".to_string(),
                     ));
@@ -559,7 +753,7 @@ impl MessageBroker for KafkaBroker {
 
                 debug!(
                     "Kafka health check passed. {} brokers available",
-                    metadata.brokers().len()
+                    broker_count
                 );
                 Ok(())
             }
@@ -568,5 +762,68 @@ impl MessageBroker for KafkaBroker {
                 e
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_transactions(toml_snippet: &str) -> KafkaTransactionConfig {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            transactions: KafkaTransactionConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_snippet).expect("config should parse");
+        wrapper.transactions
+    }
+
+    #[test]
+    fn transactions_true_enables_transactions() {
+        // Regression test: the previous #[serde(untagged)] enum parsed `true` into its
+        // Disabled(bool) variant, silently turning transactions OFF.
+        let config = parse_transactions("transactions = true");
+        assert!(config.is_enabled());
+        assert_eq!(config.get_timeout_ms(), default_transaction_timeout());
+    }
+
+    #[test]
+    fn transactions_false_disables_transactions() {
+        let config = parse_transactions("transactions = false");
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn transactions_table_enables_with_settings() {
+        let config = parse_transactions("transactions = { timeout_ms = 30000 }");
+        assert!(config.is_enabled());
+        assert_eq!(config.get_timeout_ms(), 30000);
+    }
+
+    #[test]
+    fn transactions_default_is_enabled() {
+        assert!(KafkaTransactionConfig::default().is_enabled());
+    }
+
+    #[test]
+    fn disabled_transactions_serialize_back_to_false() {
+        let json =
+            serde_json::to_value(KafkaTransactionConfig::Disabled).expect("should serialize");
+        assert_eq!(json, serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn transactional_ids_are_stable_and_unique_per_worker() {
+        let strategy = TransactionalIdStrategy::Static {
+            id: "relay".to_string(),
+        };
+        assert_eq!(
+            strategy.generate_id("outbox-worker-1"),
+            "relay-outbox-worker-1"
+        );
+        assert_ne!(
+            strategy.generate_id("outbox-worker-1"),
+            strategy.generate_id("outbox-worker-2")
+        );
     }
 }

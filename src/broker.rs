@@ -38,7 +38,8 @@ pub async fn create_broker(
     match config {
         BrokerConfig::Kafka(kafka_config) => {
             info!("Creating Kafka broker connection: {}", name);
-            let broker = crate::brokers::kafka::KafkaBroker::new(name, kafka_config, instance_id)?;
+            let broker =
+                crate::brokers::kafka::KafkaBroker::new(name, kafka_config, instance_id).await?;
             Ok(Box::new(broker))
         }
         BrokerConfig::Nats(nats_config) => {

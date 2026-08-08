@@ -58,6 +58,9 @@ pub enum ConfigValidationError {
     #[error("Duplicate queue name: '{queue_name}'")]
     DuplicateQueueName { queue_name: String },
 
+    #[error("Queue '{queue_name}' uses pop fetch mode, which removes messages at fetch time; dead_letter_queue is required so messages that fail transformation or broker delivery are preserved instead of lost")]
+    PopModeRequiresDeadLetterQueue { queue_name: String },
+
     #[error("Metrics configuration is invalid: {reason}")]
     InvalidMetricsConfig { reason: String },
 }
@@ -79,12 +82,18 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PgmqConfig {
+    /// May be omitted from the TOML file and supplied via the
+    /// PGMQ_RELAY_CONNECTION_URL environment variable instead (the environment wins
+    /// when both are set), so the database password never has to live in a config file.
+    #[serde(default)]
     #[serde(deserialize_with = "validate_connection_url")]
     pub connection_url: String,
     #[serde(default = "default_max_connections")]
     #[serde(deserialize_with = "validate_max_connections")]
     pub max_connections: u32,
 }
+
+pub const CONNECTION_URL_ENV_VAR: &str = "PGMQ_RELAY_CONNECTION_URL";
 
 fn validate_connection_url<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -474,9 +483,19 @@ fn default_metrics_port() -> u16 {
 impl Config {
     pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config = toml::from_str::<Config>(&content)?.with_env_overrides();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Environment overrides applied after parsing, before validation. Unlike the
+    /// `PGMQ_RELAY_DEFAULT_*` variables (which only fill in omitted fields), these win
+    /// over the file so secrets can be injected without editing it.
+    fn with_env_overrides(mut self) -> Self {
+        if let Ok(url) = std::env::var(CONNECTION_URL_ENV_VAR) {
+            self.pgmq.connection_url = url;
+        }
+        self
     }
 
     /// Comprehensive configuration validation with detailed error reporting
@@ -618,11 +637,34 @@ impl Config {
             });
         }
 
+        // Dead-letter queue names get the same character rules as queue names; a typo
+        // here would otherwise only surface when the first poison message fails to route.
+        if let Some(dlq) = &queue.dead_letter_queue {
+            let valid = !dlq.trim().is_empty()
+                && dlq
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+            if !valid {
+                return Err(ConfigValidationError::InvalidQueueName {
+                    queue_name: dlq.clone(),
+                });
+            }
+        }
+
         match queue.fetch_mode {
             FetchMode::Pop => {
+                // Pop deletes at fetch time, so a message that then fails transformation
+                // or broker delivery has nowhere to be retried from. Requiring a DLQ
+                // turns that silent loss into a recoverable dead-letter entry.
+                if queue.dead_letter_queue.is_none() {
+                    return Err(ConfigValidationError::PopModeRequiresDeadLetterQueue {
+                        queue_name: queue.queue_name.clone(),
+                    });
+                }
+
                 warn!(
                     queue_name = %queue.queue_name,
-                    "Queue '{}' uses pop fetch mode; PGMQ removes messages before broker delivery, so messages can be lost if transformation, broker delivery, or the relay process fails",
+                    "Queue '{}' uses pop fetch mode; PGMQ removes messages before broker delivery, so messages can still be lost if the relay crashes mid-batch or the dead-letter write fails",
                     queue.queue_name
                 );
             }
@@ -754,7 +796,8 @@ impl Config {
                         "Add at least one broker configuration under [brokers]"
                     }
                     ConfigValidationError::InvalidConnectionUrl => {
-                        "Use format: postgres://username:password@host:port/database"
+                        "Use format: postgres://username:password@host:port/database \
+                         (in the [pgmq] section or via PGMQ_RELAY_CONNECTION_URL)"
                     }
                     ConfigValidationError::InvalidMaxConnections { max_connections } => {
                         &format!("Set max_connections between 1-100, got {}", max_connections)
@@ -860,6 +903,76 @@ mod tests {
             Err(ConfigValidationError::InvalidConnectionUrl) => (),
             _ => panic!("Expected InvalidConnectionUrl error"),
         }
+    }
+
+    #[test]
+    fn test_pop_mode_without_dead_letter_queue_fails() {
+        let mut config = create_minimal_valid_config();
+        config.queues[0].fetch_mode = FetchMode::Pop;
+        config.queues[0].dead_letter_queue = None;
+
+        match config.validate() {
+            Err(ConfigValidationError::PopModeRequiresDeadLetterQueue { queue_name }) => {
+                assert_eq!(queue_name, "test_queue");
+            }
+            other => panic!(
+                "Expected PopModeRequiresDeadLetterQueue error, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_pop_mode_with_dead_letter_queue_passes() {
+        let mut config = create_minimal_valid_config();
+        config.queues[0].fetch_mode = FetchMode::Pop;
+        config.queues[0].dead_letter_queue = Some("test_queue_dlq".to_string());
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_dead_letter_queue_name_fails() {
+        let mut config = create_minimal_valid_config();
+        config.queues[0].dead_letter_queue = Some("bad name; drop table".to_string());
+
+        match config.validate() {
+            Err(ConfigValidationError::InvalidQueueName { .. }) => (),
+            other => panic!("Expected InvalidQueueName error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connection_url_env_override_wins_over_file() {
+        let config_toml = r#"
+            default_broker = "kafka"
+
+            [pgmq]
+            connection_url = "postgres://file-user:file-pass@filehost:5432/db"
+
+            [brokers.kafka]
+            type = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [[queues]]
+            queue_name = "outbox"
+        "#;
+
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(file.path(), config_toml).expect("write config");
+
+        std::env::set_var(
+            CONNECTION_URL_ENV_VAR,
+            "postgres://env-user:env-pass@envhost:5432/db",
+        );
+        let result = Config::from_file(file.path().to_str().expect("utf-8 path"));
+        std::env::remove_var(CONNECTION_URL_ENV_VAR);
+
+        let config = result.expect("config should load");
+        assert_eq!(
+            config.pgmq.connection_url,
+            "postgres://env-user:env-pass@envhost:5432/db"
+        );
     }
 
     #[test]

@@ -79,6 +79,21 @@ impl Relay {
             total_queues
         );
 
+        // Fail fast on dead-letter queues that don't exist. A missing DLQ would
+        // otherwise only surface at runtime, failing once per poison message forever.
+        let mut checked_dlqs = std::collections::HashSet::new();
+        for worker_config in &workers {
+            if let Some(dlq) = &worker_config.queue.dead_letter_queue {
+                if checked_dlqs.insert(dlq.clone()) && !self.pgmq_client.queue_exists(dlq).await? {
+                    return Err(RelayError::Configuration(format!(
+                        "dead_letter_queue '{}' configured for queue '{}' does not exist in \
+                         PGMQ - create it first with SELECT pgmq.create('{}')",
+                        dlq, worker_config.queue.queue_name, dlq
+                    )));
+                }
+            }
+        }
+
         // Broadcast shutdown via a watch channel: every worker owns its own receiver, so
         // workers run fully concurrently. (The previous Arc<RwLock<mpsc::Receiver>> was
         // held across each worker's entire processing iteration, serializing all workers
@@ -86,9 +101,9 @@ impl Relay {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        // One representative broker connection per broker name, kept for the periodic
-        // health monitor so `broker_health_check_status` reflects live state (not just the
-        // value captured at startup).
+        // Every worker's broker instance, kept for the periodic health monitor. Each
+        // worker owns a dedicated connection/producer, so all of them must be checked:
+        // a single wedged instance would otherwise hide behind a healthy sibling.
         let mut monitored_brokers: Vec<(String, String, Arc<dyn MessageBroker>)> = Vec::new();
 
         for worker_config in &workers {
@@ -138,16 +153,11 @@ impl Relay {
                 ))
             })?;
 
-            if !monitored_brokers
-                .iter()
-                .any(|(name, _, _)| name == &worker_config.broker_name)
-            {
-                monitored_brokers.push((
-                    worker_config.broker_name.clone(),
-                    broker_type.to_string(),
-                    Arc::clone(&worker_broker),
-                ));
-            }
+            monitored_brokers.push((
+                worker_config.broker_name.clone(),
+                broker_type.to_string(),
+                Arc::clone(&worker_broker),
+            ));
 
             let worker = RelayWorker {
                 worker_config: worker_config.clone(),
@@ -238,7 +248,8 @@ impl Relay {
         self.background_handles.push(readiness_handle);
 
         // Periodically re-check each broker's health so `broker_health_check_status`
-        // tracks live state and alerts on a broker going down actually fire.
+        // tracks live state and alerts on a broker going down actually fire. A broker
+        // name is reported healthy only if every worker's instance of it passes.
         if !monitored_brokers.is_empty() {
             let mut broker_shutdown = shutdown_rx.clone();
             let broker_handle = tokio::spawn(async move {
@@ -247,9 +258,16 @@ impl Relay {
                     tokio::select! {
                         _ = broker_shutdown.changed() => break,
                         _ = interval.tick() => {
+                            let mut health_by_broker: std::collections::HashMap<(String, String), bool> =
+                                std::collections::HashMap::new();
                             for (name, broker_type, broker) in &monitored_brokers {
                                 let healthy = broker.health_check().await.is_ok();
-                                metrics::record_broker_health(name, broker_type, healthy);
+                                *health_by_broker
+                                    .entry((name.clone(), broker_type.clone()))
+                                    .or_insert(true) &= healthy;
+                            }
+                            for ((name, broker_type), healthy) in health_by_broker {
+                                metrics::record_broker_health(&name, &broker_type, healthy);
                             }
                         }
                     }
@@ -341,6 +359,26 @@ struct RelayWorker {
     metrics_service: Arc<dyn MetricsService>,
 }
 
+/// Outcome of one processing iteration, used by the worker loop for pacing.
+enum ProcessOutcome {
+    /// Nothing to do (empty poll or completion gate closed); idle for the remainder of
+    /// the poll interval before trying again.
+    Idle,
+    /// A batch was processed; poll again immediately.
+    Processed,
+}
+
+/// Backoff after consecutive processing errors: doubles from the poll interval up to a
+/// 30s ceiling. Without this a fast-failing dependency (dropped table, connection
+/// refused) turns every worker into a busy loop hammering the recovering system.
+fn error_backoff(poll_interval: Duration, consecutive_failures: u32) -> Duration {
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let exponent = consecutive_failures.saturating_sub(1).min(16);
+    poll_interval
+        .saturating_mul(2u32.saturating_pow(exponent))
+        .clamp(poll_interval, MAX_BACKOFF)
+}
+
 impl RelayWorker {
     async fn run(&self) -> Result<(), RelayError> {
         let queue_name = &self.worker_config.queue.queue_name;
@@ -351,28 +389,55 @@ impl RelayWorker {
 
         // Own a local clone so we can await changes without sharing a lock with other workers.
         let mut shutdown_rx = self.shutdown_rx.clone();
+        let mut consecutive_failures: u32 = 0;
 
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Shutdown signal received for worker '{}'", self.worker_config.name);
-                    break;
+        // Shutdown is observed between iterations (and during the idle/backoff sleeps),
+        // never by cancelling an in-flight iteration: cancellation could land between
+        // broker acknowledgement and PGMQ completion, guaranteeing duplicates on every
+        // restart. The shutdown deadline in `Relay::shutdown` still bounds a slow batch.
+        while !*shutdown_rx.borrow() {
+            let iteration_start = Instant::now();
+
+            match self.process_messages().await {
+                Ok(ProcessOutcome::Processed) => {
+                    consecutive_failures = 0;
                 }
-                result = self.process_messages() => {
-                    if let Err(e) = result {
-                        error!(
-                            worker = %self.worker_config.name,
-                            error = %e,
-                            "Message processing failed"
-                        );
+                Ok(ProcessOutcome::Idle) => {
+                    consecutive_failures = 0;
+                    let remaining = self
+                        .worker_config
+                        .poll_interval
+                        .saturating_sub(iteration_start.elapsed());
+                    if !remaining.is_zero() {
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => break,
+                            _ = tokio::time::sleep(remaining) => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff =
+                        error_backoff(self.worker_config.poll_interval, consecutive_failures);
+                    error!(
+                        worker = %self.worker_config.name,
+                        error = %e,
+                        consecutive_failures,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "Message processing failed - backing off before retry"
+                    );
 
-                        metrics::record_worker_operation_error(
-                            &self.worker_config.name,
-                            "process",
-                            &self.worker_config.queue.queue_name,
-                            self.worker_config.queue.effective_destination_topic(),
-                            &e,
-                        );
+                    metrics::record_worker_operation_error(
+                        &self.worker_config.name,
+                        "process",
+                        &self.worker_config.queue.queue_name,
+                        self.worker_config.queue.effective_destination_topic(),
+                        &e,
+                    );
+
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => break,
+                        _ = tokio::time::sleep(backoff) => {}
                     }
                 }
             }
@@ -382,11 +447,36 @@ impl RelayWorker {
         Ok(())
     }
 
-    async fn process_messages(&self) -> Result<(), RelayError> {
+    async fn process_messages(&self) -> Result<ProcessOutcome, RelayError> {
         let start_time = Instant::now();
 
         // Each worker handles exactly one queue
         let queue_config = &self.worker_config.queue;
+        let is_pop_mode = matches!(queue_config.fetch_mode, crate::config::FetchMode::Pop);
+
+        // Gate on completion readiness BEFORE polling. For read modes, polling while the
+        // completion circuit breaker is open would deliver messages we cannot complete
+        // (duplicates) or burn visibility timeouts. Pop mode is exempt: pop deletes at
+        // fetch time and needs no completion - and gating it after the fetch would
+        // permanently discard the already-popped batch.
+        if !is_pop_mode && !self.pgmq_client.is_ready_to_process() {
+            warn!(
+                worker = %self.worker_config.name,
+                queue = %queue_config.queue_name,
+                "PGMQ client not ready to complete messages - skipping poll until the \
+                 circuit breaker closes"
+            );
+
+            metrics::record_worker_operation_error(
+                &self.worker_config.name,
+                "send",
+                &queue_config.queue_name,
+                queue_config.effective_destination_topic(),
+                &RelayError::PgmqClientNotReady,
+            );
+
+            return Ok(ProcessOutcome::Idle);
+        }
 
         let poll_start_time = Instant::now();
         let queue_messages = self
@@ -413,12 +503,9 @@ impl RelayWorker {
         );
 
         if queue_messages.messages.is_empty() {
-            let poll_elapsed = poll_start_time.elapsed();
-            if poll_elapsed < self.worker_config.poll_interval {
-                let remaining_sleep = self.worker_config.poll_interval - poll_elapsed;
-                tokio::time::sleep(remaining_sleep).await;
-            }
-            return Ok(());
+            // The idle sleep lives in the worker loop, where it stays responsive to
+            // shutdown without cancelling an in-flight batch.
+            return Ok(ProcessOutcome::Idle);
         }
 
         let total_messages = queue_messages.messages.len();
@@ -462,26 +549,6 @@ impl RelayWorker {
 
         let destination_topic = queue_config.effective_destination_topic().to_string();
 
-        // Check if PGMQ client is ready to process messages
-        // If not, don't send to broker to maintain exactly-once delivery
-        if !self.pgmq_client.is_ready_to_process() {
-            warn!(
-                worker = %self.worker_config.name,
-                total_messages = total_messages,
-                "PGMQ client not ready to process - skipping broker send to prevent exactly-once violations"
-            );
-
-            metrics::record_worker_operation_error(
-                &self.worker_config.name,
-                "send",
-                &queue_config.queue_name,
-                queue_config.effective_destination_topic(),
-                &RelayError::PgmqClientNotReady,
-            );
-
-            return Ok(());
-        }
-
         // msg_ids that have been fully handled and can be removed from the source queue:
         // either delivered to the broker or routed to the dead-letter queue.
         let mut ids_to_complete: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -507,15 +574,39 @@ impl RelayWorker {
                                 ids_to_complete.insert(message.msg_id);
                             }
                             Err(e) => {
-                                error!(
-                                    worker = %self.worker_config.name,
-                                    msg_id = message.msg_id,
-                                    error = %e,
-                                    "Failed to route poison message to dead-letter queue - will retry"
-                                );
+                                if is_pop_mode {
+                                    error!(
+                                        worker = %self.worker_config.name,
+                                        msg_id = message.msg_id,
+                                        error = %e,
+                                        "Failed to route poison message to dead-letter queue; \
+                                         pop mode already removed it from the source queue - \
+                                         the message is LOST"
+                                    );
+                                } else {
+                                    error!(
+                                        worker = %self.worker_config.name,
+                                        msg_id = message.msg_id,
+                                        error = %e,
+                                        "Failed to route poison message to dead-letter queue - will retry"
+                                    );
+                                }
                             }
                         }
                     }
+                }
+                // Unreachable when the config was validated (pop mode requires a DLQ);
+                // kept as a safety net for hand-built configs.
+                None if is_pop_mode => {
+                    error!(
+                        worker = %self.worker_config.name,
+                        failed = transform_failed.len(),
+                        "{} message(s) failed transformation in pop mode with no \
+                         dead_letter_queue configured; pop already removed them from the \
+                         source queue - they are LOST. Configure dead_letter_queue to \
+                         capture them.",
+                        transform_failed.len()
+                    );
                 }
                 None => {
                     warn!(
@@ -529,47 +620,102 @@ impl RelayWorker {
             }
         }
 
+        // A whole-batch send error must not skip the completion block below: messages
+        // already routed to the DLQ have to be completed regardless, or they would be
+        // re-read after the visibility timeout and dead-lettered again (duplicates in
+        // the DLQ). The error is re-raised after completion.
+        let mut send_error: Option<RelayError> = None;
+
         if !relay_messages.is_empty() {
             let send_start_time = Instant::now();
-            let send_result = self
+            match self
                 .broker
                 .send_batch(&destination_topic, &relay_messages)
                 .await
-                .map_err(|e| {
+            {
+                Ok(send_result) => {
+                    let send_duration = send_start_time.elapsed();
+                    let send_success = send_result.failed_messages.is_empty();
+
+                    metrics::record_broker_send(
+                        &self.worker_config.broker_name,
+                        &self.broker_type,
+                        &destination_topic,
+                        send_duration.as_secs_f64(),
+                        relay_messages.len(),
+                        send_success,
+                    );
+
+                    trace!(
+                        worker = %self.worker_config.name,
+                        succeeded = send_result.successful_message_ids.len(),
+                        failed = send_result.failed_messages.len(),
+                        "Broker delivery completed"
+                    );
+
+                    if !send_success {
+                        warn!(
+                            worker = %self.worker_config.name,
+                            total = relay_messages.len(),
+                            succeeded = send_result.successful_message_ids.len(),
+                            failed = send_result.failed_messages.len(),
+                            "Partial send failure - only completing successfully sent messages"
+                        );
+
+                        // Pop-mode messages no longer exist in the source queue, so a
+                        // broker rejection cannot be retried - preserve them in the DLQ.
+                        if is_pop_mode {
+                            let by_id: std::collections::HashMap<_, _> = queue_messages
+                                .messages
+                                .iter()
+                                .map(|m| (m.msg_id, m))
+                                .collect();
+                            let failures: Vec<_> = send_result
+                                .failed_messages
+                                .iter()
+                                .filter_map(|(id, err)| {
+                                    by_id
+                                        .get(id)
+                                        .map(|message| ((*message).clone(), err.clone()))
+                                })
+                                .collect();
+                            self.dead_letter_pop_failures(failures).await;
+                        }
+                    }
+
+                    ids_to_complete.extend(send_result.successful_message_ids.iter().copied());
+                }
+                Err(e) => {
+                    let send_duration = send_start_time.elapsed();
                     error!("Failed to send batch to broker: {}", e);
-                    e
-                })?;
-            let send_duration = send_start_time.elapsed();
+                    metrics::record_broker_send(
+                        &self.worker_config.broker_name,
+                        &self.broker_type,
+                        &destination_topic,
+                        send_duration.as_secs_f64(),
+                        relay_messages.len(),
+                        false,
+                    );
 
-            let send_success = send_result.failed_messages.is_empty();
+                    // Same as above: pop-mode messages cannot be re-read, so on a
+                    // whole-batch failure preserve every attempted message in the DLQ.
+                    // (If the failure was a commit-timeout ambiguity this may duplicate
+                    // into the DLQ - acceptable under at-least-once.)
+                    if is_pop_mode {
+                        let relay_ids: std::collections::HashSet<i64> =
+                            relay_messages.iter().map(|m| m.id).collect();
+                        let failures: Vec<_> = queue_messages
+                            .messages
+                            .iter()
+                            .filter(|m| relay_ids.contains(&m.msg_id))
+                            .map(|m| (m.clone(), format!("Broker send failed: {}", e)))
+                            .collect();
+                        self.dead_letter_pop_failures(failures).await;
+                    }
 
-            metrics::record_broker_send(
-                &self.worker_config.broker_name,
-                &self.broker_type,
-                &destination_topic,
-                send_duration.as_secs_f64(),
-                relay_messages.len(),
-                send_success,
-            );
-
-            trace!(
-                worker = %self.worker_config.name,
-                succeeded = send_result.successful_message_ids.len(),
-                failed = send_result.failed_messages.len(),
-                "Broker delivery completed"
-            );
-
-            if !send_success {
-                warn!(
-                    worker = %self.worker_config.name,
-                    total = relay_messages.len(),
-                    succeeded = send_result.successful_message_ids.len(),
-                    failed = send_result.failed_messages.len(),
-                    "Partial send failure - only completing successfully sent messages"
-                );
+                    send_error = Some(e);
+                }
             }
-
-            ids_to_complete.extend(send_result.successful_message_ids.iter().copied());
         }
 
         // Complete (delete or archive) exactly the messages that were delivered to the
@@ -633,6 +779,12 @@ impl RelayWorker {
             }
         }
 
+        // Now that DLQ-routed messages are completed, surface a whole-batch broker
+        // failure to the worker loop (which records the error and backs off).
+        if let Some(e) = send_error {
+            return Err(e);
+        }
+
         let processing_duration = start_time.elapsed().as_secs_f64();
 
         metrics::record_worker_operation(
@@ -662,6 +814,83 @@ impl RelayWorker {
             "Message batch processing completed"
         );
 
-        Ok(())
+        Ok(ProcessOutcome::Processed)
+    }
+
+    /// Preserve pop-mode messages in the dead-letter queue after a broker failure. Pop
+    /// removed them from the source queue at fetch time, so the DLQ is the only place
+    /// they survive; a message is lost only if the DLQ write itself fails.
+    /// Takes owned messages: this only runs on the failure path, where the clone cost
+    /// is irrelevant next to keeping the worker future free of borrowed iterators.
+    async fn dead_letter_pop_failures(
+        &self,
+        failures: Vec<(crate::pgmq_client::PgmqMessageWithHeaders, String)>,
+    ) {
+        let queue_config = &self.worker_config.queue;
+        let Some(dlq) = &queue_config.dead_letter_queue else {
+            // Unreachable when the config was validated (pop mode requires a DLQ);
+            // kept as a safety net for hand-built configs.
+            error!(
+                worker = %self.worker_config.name,
+                queue = %queue_config.queue_name,
+                "No dead_letter_queue configured for pop-mode queue - undeliverable \
+                 messages are LOST"
+            );
+            return;
+        };
+
+        for (message, error_text) in failures {
+            match self
+                .pgmq_client
+                .send_to_dead_letter(
+                    dlq.as_str(),
+                    &queue_config.queue_name,
+                    &message,
+                    error_text.as_str(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    warn!(
+                        worker = %self.worker_config.name,
+                        msg_id = message.msg_id,
+                        dead_letter_queue = %dlq,
+                        "Pop-mode message preserved in dead-letter queue after broker failure"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        worker = %self.worker_config.name,
+                        msg_id = message.msg_id,
+                        error = %e,
+                        "Failed to dead-letter pop-mode message after broker failure - \
+                         the message is LOST"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn error_backoff_doubles_from_poll_interval_and_caps_at_thirty_seconds() {
+        let base = Duration::from_millis(250);
+        assert_eq!(error_backoff(base, 1), Duration::from_millis(250));
+        assert_eq!(error_backoff(base, 2), Duration::from_millis(500));
+        assert_eq!(error_backoff(base, 3), Duration::from_secs(1));
+        assert_eq!(error_backoff(base, 8), Duration::from_secs(30));
+        assert_eq!(error_backoff(base, 100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn error_backoff_never_drops_below_the_poll_interval() {
+        let base = Duration::from_millis(10);
+        assert_eq!(error_backoff(base, 0), Duration::from_millis(10));
+        assert_eq!(error_backoff(base, 1), Duration::from_millis(10));
     }
 }

@@ -163,12 +163,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     app_task_handles.push(uptime_handle);
 
-    info!("PGMQ Relay is running. Press Ctrl+C to stop.");
+    info!("PGMQ Relay is running. Send SIGTERM or press Ctrl+C to stop.");
 
     let mut fatal_error: Option<RelayError> = None;
 
     tokio::select! {
-        _ = signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             info!("Received shutdown signal");
         }
         result = relay.wait_for_shutdown() => {
@@ -187,15 +187,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_timeout = Duration::from_secs(cli.shutdown_timeout);
     let _ = app_shutdown_tx.send(true);
-    relay.shutdown(shutdown_timeout).await?;
-    shutdown_app_tasks(&mut app_task_handles, shutdown_timeout).await?;
+
+    // Run both shutdown phases before reporting: a fatal error is the root cause and
+    // must win over a secondary shutdown timeout, or the exit reason gets misreported.
+    let relay_shutdown = relay.shutdown(shutdown_timeout).await;
+    let app_tasks_shutdown = shutdown_app_tasks(&mut app_task_handles, shutdown_timeout).await;
 
     if let Some(error) = fatal_error {
         return Err(error.into());
     }
+    relay_shutdown?;
+    app_tasks_shutdown?;
 
     info!("PGMQ Relay stopped");
     Ok(())
+}
+
+/// Resolve when the process is asked to stop. Handles SIGTERM in addition to Ctrl+C
+/// (SIGINT): the relay runs as PID 1 in containers, where `docker stop` and Kubernetes
+/// send SIGTERM - without this handler the default disposition kills the process
+/// instantly and graceful shutdown never runs.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal as unix_signal, SignalKind};
+
+    let mut sigterm = match unix_signal(SignalKind::terminate()) {
+        Ok(sigterm) => sigterm,
+        Err(e) => {
+            // Extremely unlikely; fall back to SIGINT-only rather than aborting startup.
+            error!(
+                "Failed to install SIGTERM handler: {}; only Ctrl+C will be handled",
+                e
+            );
+            let _ = signal::ctrl_c().await;
+            return;
+        }
+    };
+
+    tokio::select! {
+        _ = signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = signal::ctrl_c().await;
 }
 
 async fn shutdown_app_tasks(
