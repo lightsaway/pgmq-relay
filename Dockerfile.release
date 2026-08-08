@@ -2,7 +2,7 @@
 
 # Release images package binaries produced by the native Linux matrix jobs.
 # The regular Dockerfile remains the standalone source build used locally.
-FROM ubuntu:24.04 AS runtime-root
+FROM ubuntu:26.04 AS runtime-root
 
 ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive
