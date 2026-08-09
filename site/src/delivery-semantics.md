@@ -42,6 +42,8 @@ The dead-letter operation preserves the original headers and adds diagnostic met
 
 ## Pop mode: at most once
 
-`fetch_mode = "pop"` removes rows while fetching them. A later transformation error, broker error, process crash, or network failure loses those messages.
+`fetch_mode = "pop"` removes rows while fetching them, so a failure after the fetch cannot be retried from the source queue.
+
+Because of this, `dead_letter_queue` is **required** for pop queues (configuration validation rejects a pop queue without one). Messages that fail transformation or are rejected by the broker are preserved in the dead-letter queue instead of being dropped. The remaining loss windows are a process crash mid-batch and a failing dead-letter write itself.
 
 The relay logs a startup warning for every `pop` queue. Use it only when loss is explicitly acceptable.

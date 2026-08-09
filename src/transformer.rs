@@ -142,17 +142,19 @@ impl MessageTransformer {
         );
         relay_headers.insert("pgmq_queue_name".to_string(), queue_name.to_string());
 
-        // If we have a key, also add it as a header for debugging
+        // If we have a key, also add it as a header for debugging. Per-message logging
+        // stays at trace level: at info it floods production logs (two lines per
+        // message) and leaks message key values into log aggregators.
         if let Some(ref key) = message_key {
             relay_headers.insert("pgmq_message_key".to_string(), key.clone());
-            tracing::info!(
+            tracing::trace!(
                 "Extracted message key '{}' from field '{}' for message {}",
                 key,
                 key_field,
                 msg_id
             );
         } else {
-            tracing::info!(
+            tracing::trace!(
                 "No message key found in field '{}' for message {}, using message ID as fallback",
                 key_field,
                 msg_id

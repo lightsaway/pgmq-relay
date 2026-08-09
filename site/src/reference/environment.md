@@ -1,6 +1,12 @@
 # Environment Variables
 
-Environment variables provide defaults only when the corresponding TOML field is omitted.
+Environment variables provide defaults only when the corresponding TOML field is omitted, with one exception: `PGMQ_RELAY_CONNECTION_URL` always overrides the TOML file, so the database password never has to live in a config file.
+
+## Overrides
+
+| Variable | Purpose |
+|---|---|
+| `PGMQ_RELAY_CONNECTION_URL` | PostgreSQL connection URL; wins over `pgmq.connection_url`. With it set, `connection_url` may be omitted from the TOML file entirely. |
 
 ## Process
 

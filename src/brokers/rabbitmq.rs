@@ -138,6 +138,27 @@ pub struct RabbitMQBroker {
 }
 
 impl RabbitMQBroker {
+    /// Create one publish channel with publisher confirms enabled. Without
+    /// `confirm_select`, the confirm future returned by basic_publish resolves to
+    /// `NotRequested` immediately, giving a fake ack and risking silent message loss.
+    async fn create_channel(connection: &Connection, index: usize) -> Result<Channel, RelayError> {
+        let channel = connection.create_channel().await.map_err(|e| {
+            RelayError::BrokerConfiguration(format!("Failed to create channel: {}", e))
+        })?;
+
+        channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await
+            .map_err(|e| {
+                RelayError::BrokerConfiguration(format!(
+                    "Failed to enable publisher confirms on channel {}: {}",
+                    index, e
+                ))
+            })?;
+
+        Ok(channel)
+    }
+
     /// Establish a connection and a pool of `pool_size` channels, each with publisher
     /// confirms enabled, and declare the exchange once.
     async fn connect(config: &RabbitMQConfig) -> Result<ConnectionPool, RelayError> {
@@ -149,28 +170,13 @@ impl RabbitMQBroker {
 
         let mut channels = Vec::with_capacity(config.pool_size);
         for i in 0..config.pool_size {
-            let channel = connection.create_channel().await.map_err(|e| {
-                RelayError::BrokerConfiguration(format!("Failed to create channel: {}", e))
-            })?;
-
-            // Enable publisher confirms on this channel. Without this, the confirm future
-            // returned by basic_publish resolves to `NotRequested` immediately, giving a
-            // fake ack and risking silent message loss.
-            channel
-                .confirm_select(ConfirmSelectOptions::default())
-                .await
-                .map_err(|e| {
-                    RelayError::BrokerConfiguration(format!(
-                        "Failed to enable publisher confirms on channel {}: {}",
-                        i, e
-                    ))
-                })?;
+            let channel = Self::create_channel(&connection, i).await?;
 
             // Declare the exchange once (on the first channel) if configured.
             if i == 0 && config.declare_exchange && !config.exchange.is_empty() {
                 channel
                     .exchange_declare(
-                        &config.exchange,
+                        config.exchange.as_str().into(),
                         lapin::ExchangeKind::Custom(config.exchange_type.clone()),
                         ExchangeDeclareOptions {
                             durable: config.durable,
@@ -207,7 +213,8 @@ impl RabbitMQBroker {
     pub async fn new(name: &str, config: &RabbitMQConfig) -> Result<Self, RelayError> {
         info!(
             "Creating RabbitMQ broker '{}' with URL: {}",
-            name, config.url
+            name,
+            crate::logging::redact_url(&config.url)
         );
 
         let pool = Self::connect(config).await?;
@@ -306,14 +313,44 @@ impl MessageBroker for RabbitMQBroker {
 
             let idx = pool.next % channel_count;
             pool.next = pool.next.wrapping_add(1);
+
+            // A channel-level error (e.g. a precondition failure) closes that channel
+            // without dropping the connection. Repair it here, otherwise this pool slot
+            // would fail its share of every future batch.
+            if !pool.channels[idx].status().connected() {
+                warn!(
+                    broker = %self.name,
+                    channel_index = idx,
+                    "RabbitMQ channel is closed - recreating"
+                );
+                match Self::create_channel(&pool.connection, idx).await {
+                    Ok(channel) => pool.channels[idx] = channel,
+                    Err(e) => {
+                        error!(
+                            broker = %self.name,
+                            channel_index = idx,
+                            error = %e,
+                            "Failed to recreate RabbitMQ channel"
+                        );
+                        failed_messages
+                            .push((message.id, format!("Channel recreation failed: {}", e)));
+                        continue;
+                    }
+                }
+            }
             let channel = &pool.channels[idx];
 
+            // `mandatory: true` makes the broker return unroutable messages instead of
+            // acking and dropping them; the returned message surfaces in phase 2.
             match timeout_at(
                 deadline,
                 channel.basic_publish(
-                    &self.config.exchange,
-                    routing_key,
-                    BasicPublishOptions::default(),
+                    self.config.exchange.as_str().into(),
+                    routing_key.into(),
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..Default::default()
+                    },
                     &message.payload,
                     properties,
                 ),
@@ -365,8 +402,28 @@ impl MessageBroker for RabbitMQBroker {
                     );
                     failed_messages.push((msg_id, "Message nack'd by broker".to_string()));
                 }
-                Ok(Ok(_)) => {
-                    successful_ids.push(msg_id);
+                Ok(Ok(confirmation)) => {
+                    // With `mandatory: true`, an unroutable message is acked *and*
+                    // returned. Treating that ack as success would delete a message from
+                    // PGMQ that the broker dropped (e.g. destination queue not declared).
+                    if let Some(returned) = confirmation.take_message() {
+                        error!(
+                            broker = %self.name,
+                            msg_id = msg_id,
+                            reply_code = returned.reply_code,
+                            reply_text = %returned.reply_text,
+                            "Message was returned as unroutable by RabbitMQ"
+                        );
+                        failed_messages.push((
+                            msg_id,
+                            format!(
+                                "Unroutable message returned by broker: {} (code {})",
+                                returned.reply_text, returned.reply_code
+                            ),
+                        ));
+                    } else {
+                        successful_ids.push(msg_id);
+                    }
                 }
                 Ok(Err(e)) => {
                     error!(

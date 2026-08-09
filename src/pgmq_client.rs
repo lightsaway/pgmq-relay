@@ -60,19 +60,26 @@ pub trait PgmqClient: Send + Sync {
         error: &str,
     ) -> Result<(), RelayError>;
 
+    /// Whether a PGMQ queue with this name exists. Used to fail fast at startup on
+    /// misconfigured dead-letter queues instead of erroring per message at runtime.
+    async fn queue_exists(&self, queue_name: &str) -> Result<bool, RelayError>;
+
     fn is_ready_to_process(&self) -> bool;
 }
 
 pub struct PgmqClientImpl {
     pool: Arc<Pool<Postgres>>,
-    deletion_circuit_breaker: PgmqCircuitBreaker<GlobalCircuitBreakerMetrics>,
+    /// Protects the completion step (delete or archive). The metric/breaker name keeps
+    /// the historical "deletion" label for dashboard compatibility.
+    completion_circuit_breaker: PgmqCircuitBreaker<GlobalCircuitBreakerMetrics>,
 }
 
 impl PgmqClientImpl {
     pub async fn new(config: &PgmqConfig) -> Result<Self, RelayError> {
         info!(
             "Connecting to PGMQ at: {} with max_connections: {}",
-            config.connection_url, config.max_connections
+            crate::logging::redact_url(&config.connection_url),
+            config.max_connections
         );
 
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -92,12 +99,12 @@ impl PgmqClientImpl {
 
         let circuit_breaker_config = CircuitBreakerConfig::default();
         let metrics = GlobalCircuitBreakerMetrics::new("pgmq_deletion");
-        let deletion_circuit_breaker =
+        let completion_circuit_breaker =
             PgmqCircuitBreaker::new("pgmq-deletion".to_string(), circuit_breaker_config, metrics);
 
         Ok(Self {
             pool: Arc::new(pool),
-            deletion_circuit_breaker,
+            completion_circuit_breaker,
         })
     }
 
@@ -236,7 +243,7 @@ impl PgmqClient for PgmqClientImpl {
         let msg_ids_owned = msg_ids.clone();
 
         let result = self
-            .deletion_circuit_breaker
+            .completion_circuit_breaker
             .execute(move || {
                 let pool = pool.clone();
                 let queue_name_owned = queue_name_owned.clone();
@@ -246,18 +253,32 @@ impl PgmqClient for PgmqClientImpl {
                     // pgmq.delete(queue_name text, msg_ids bigint[]). This is one round-trip
                     // and a single atomic statement, so the batch can no longer be left
                     // partially completed by a mid-loop failure.
-                    sqlx::query("SELECT pgmq.delete($1::text, $2::bigint[])")
-                        .bind(&queue_name_owned)
-                        .bind(&msg_ids_owned)
-                        .execute(&*pool)
-                        .await
-                        .map_err(|e| {
-                            RelayError::PgmqOperation(format!(
-                                "Failed to delete {} messages: {}",
-                                msg_ids_owned.len(),
-                                e
-                            ))
-                        })?;
+                    //
+                    // pgmq.delete returns the set of ids it actually deleted; a shortfall
+                    // (e.g. wrong queue name resolving to zero rows) must not pass as
+                    // success or the messages would redeliver forever, invisibly.
+                    let deleted: Vec<i64> =
+                        sqlx::query_scalar("SELECT pgmq.delete($1::text, $2::bigint[])")
+                            .bind(&queue_name_owned)
+                            .bind(&msg_ids_owned)
+                            .fetch_all(&*pool)
+                            .await
+                            .map_err(|e| {
+                                RelayError::PgmqOperation(format!(
+                                    "Failed to delete {} messages: {}",
+                                    msg_ids_owned.len(),
+                                    e
+                                ))
+                            })?;
+                    if deleted.len() != msg_ids_owned.len() {
+                        tracing::warn!(
+                            queue = %queue_name_owned,
+                            requested = msg_ids_owned.len(),
+                            deleted = deleted.len(),
+                            "pgmq.delete removed fewer messages than requested (already \
+                             deleted by another consumer, or wrong queue?)"
+                        );
+                    }
                     Ok(())
                 }
             })
@@ -288,34 +309,74 @@ impl PgmqClient for PgmqClientImpl {
         }
 
         let msg_ids: Vec<i64> = queue_messages.messages.iter().map(|m| m.msg_id).collect();
+        let queue_name = &queue_messages.queue_name;
 
         tracing::trace!(
-            "Archiving {} messages from queue '{}'",
+            "Archiving {} messages from queue '{}' with circuit breaker protection",
             msg_ids.len(),
-            queue_messages.queue_name
+            queue_name
         );
 
-        // Archive the whole batch in a single statement using the array form
-        // pgmq.archive(queue_name text, msg_ids bigint[]) - one round-trip, atomic.
-        sqlx::query("SELECT pgmq.archive($1::text, $2::bigint[])")
-            .bind(&queue_messages.queue_name)
-            .bind(&msg_ids)
-            .execute(&*self.pool)
-            .await
-            .map_err(|e| {
-                RelayError::PgmqOperation(format!(
-                    "Failed to archive {} messages: {}",
+        let pool = self.pool.clone();
+        let queue_name_owned = queue_name.clone();
+        let msg_ids_owned = msg_ids.clone();
+
+        // Same breaker + retry protection as deletion: archive is the completion step
+        // for archive-mode queues, and without the breaker a persistently failing
+        // archive table would re-publish the same batch to the broker every visibility
+        // timeout with `is_ready_to_process()` still reporting true.
+        let result = self
+            .completion_circuit_breaker
+            .execute(move || {
+                let pool = pool.clone();
+                let queue_name_owned = queue_name_owned.clone();
+                let msg_ids_owned = msg_ids_owned.clone();
+                async move {
+                    // Archive the whole batch in a single statement using the array form
+                    // pgmq.archive(queue_name text, msg_ids bigint[]) - one round-trip, atomic.
+                    let archived: Vec<i64> =
+                        sqlx::query_scalar("SELECT pgmq.archive($1::text, $2::bigint[])")
+                            .bind(&queue_name_owned)
+                            .bind(&msg_ids_owned)
+                            .fetch_all(&*pool)
+                            .await
+                            .map_err(|e| {
+                                RelayError::PgmqOperation(format!(
+                                    "Failed to archive {} messages: {}",
+                                    msg_ids_owned.len(),
+                                    e
+                                ))
+                            })?;
+                    if archived.len() != msg_ids_owned.len() {
+                        tracing::warn!(
+                            queue = %queue_name_owned,
+                            requested = msg_ids_owned.len(),
+                            archived = archived.len(),
+                            "pgmq.archive moved fewer messages than requested (already \
+                             completed by another consumer, or wrong queue?)"
+                        );
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+
+        match result {
+            Ok(_) => {
+                info!(
+                    "Archived {} messages from queue '{}' to archive table",
                     msg_ids.len(),
-                    e
-                ))
-            })?;
-
-        info!(
-            "Archived {} messages from queue '{}' to archive table",
-            msg_ids.len(),
-            queue_messages.queue_name
-        );
-
+                    queue_name
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed to archive messages from queue '{}': {}",
+                    queue_name, e
+                );
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -403,9 +464,24 @@ impl PgmqClient for PgmqClientImpl {
         Ok(())
     }
 
+    async fn queue_exists(&self, queue_name: &str) -> Result<bool, RelayError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pgmq.list_queues() WHERE queue_name = $1::text)",
+        )
+        .bind(queue_name)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| {
+            RelayError::PgmqOperation(format!(
+                "Failed to check whether queue '{}' exists: {}",
+                queue_name, e
+            ))
+        })
+    }
+
     fn is_ready_to_process(&self) -> bool {
-        // Check if the deletion circuit breaker allows operations
+        // Check if the completion circuit breaker allows operations
         // If it's open, we can't properly complete message processing
-        self.deletion_circuit_breaker.is_call_permitted()
+        self.completion_circuit_breaker.is_call_permitted()
     }
 }

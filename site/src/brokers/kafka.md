@@ -45,6 +45,8 @@ retries = 3
 
 The hostname strategy creates a stable transactional ID per worker. Stable IDs allow Kafka to fence stale producers after restart.
 
+`retries` is accepted for backward compatibility but no longer mapped to librdkafka's `retries` setting: idempotent producers manage send retries themselves, bounded by `message.timeout.ms`.
+
 Other strategies:
 
 ```toml
@@ -54,7 +56,7 @@ strategy = { type = "random", prefix = "relay" }
 
 A static base is suffixed by worker name. Random IDs do not provide stable producer fencing across restarts.
 
-Disable transactions for higher throughput:
+Both boolean forms are accepted: `transactions = true` enables transactions with default settings (equivalent to omitting the field), and disabling them for higher throughput is:
 
 ```toml
 transactions = false

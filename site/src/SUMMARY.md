@@ -22,6 +22,7 @@
 - [Kafka](./brokers/kafka.md)
 - [RabbitMQ](./brokers/rabbitmq.md)
 - [NATS](./brokers/nats.md)
+- [Add a Destination Broker](./brokers/adding-a-broker.md)
 
 # Operations
 

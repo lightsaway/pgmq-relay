@@ -127,6 +127,21 @@ services:
     networks:
       - pgmq-network
 
+  # One-shot JetStream provisioning: the relay publishes with JetStream acknowledgements
+  # by default, which requires a stream covering the destination subjects.
+  nats-init:
+    image: natsio/nats-box:latest
+    container_name: nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    command: >
+      nats --server nats://nats:4222 stream add LOGS
+      --subjects "logs.>" --storage file --retention limits --defaults
+    restart: "no"
+    networks:
+      - pgmq-network
+
   # NATS UI
   nats-ui:
     image: ghcr.io/nats-nui/nui:latest
@@ -159,6 +174,8 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
     environment:
       RUST_LOG: info
       RUST_BACKTRACE: 1

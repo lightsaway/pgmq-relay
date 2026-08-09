@@ -89,4 +89,7 @@ fetch_mode = "read_grouped"
 # key_field = "event_id"
 # fetch_mode = "pop"
 # batch_size = 10
+# # Pop removes messages at fetch time, so a dead-letter queue is REQUIRED to
+# # preserve messages that fail transformation or broker delivery:
+# dead_letter_queue = "fire_and_forget_dlq"
 # # Note: archive_messages has no effect with pop mode
