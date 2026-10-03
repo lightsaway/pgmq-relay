@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Build stage - use Alpine for minimal image size
-FROM rust:1.97-alpine AS builder
+FROM rust:1.98-alpine AS builder
 
 ARG TARGETARCH
 
