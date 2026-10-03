@@ -35,7 +35,7 @@ humantime-serde = "1.1"
 # Message broker integrations
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
 lapin = "4.10"
-async-nats = "0.49"
+async-nats = "0.50"
 
 # Error handling and logging
 thiserror = "2.0"
