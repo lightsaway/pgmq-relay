@@ -3607,9 +3607,9 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-resilience-circuitbreaker"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1c89ebacecf47734e7a562f615997bd54e1867ca26fb596f309d63ca5f6f42a"
+checksum = "907b3e0e10be24e4b47abb41569882005025ad717ba38f735c22ec1196b72e6c"
 dependencies = [
  "futures",
  "thiserror 2.0.19",
@@ -3620,9 +3620,9 @@ dependencies = [
 
 [[package]]
 name = "tower-resilience-core"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13d51ef3353f58a987373162f9f68d6c9e555d1e09a215c224bf4e1f9e135138"
+checksum = "25eeb90521cdd34e4ed4ba21b5492311393eac927b015ca78c94658e13f5d137"
 dependencies = [
  "thiserror 2.0.19",
  "tokio",
