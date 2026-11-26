@@ -58,7 +58,7 @@ uuid = { version = "1.0", features = ["v4"] }
 
 # Circuit breaker and error recovery
 backon = { version = "1.6", default-features = false, features = ["std", "tokio-sleep"] }
-tower-resilience-circuitbreaker = "0.10"
+tower-resilience-circuitbreaker = "0.13"
 
 # Metrics and monitoring
 prometheus = "0.14"
