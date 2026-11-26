@@ -1,4 +1,6 @@
 [advisories]
 # Retained in Cargo.lock by transitive package metadata, but not reachable in
-# any enabled target or feature graph. The advisory has no fixed release.
-ignore = ["RUSTSEC-2023-0071"]
+# any enabled target or feature graph. RUSTSEC-2023-0071 has no fixed release;
+# RUSTSEC-2026-0459 (libsqlite3-sys via sqlx-sqlite) needs sqlx 0.9, and the
+# sqlite feature is not enabled by this project.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0459"]
