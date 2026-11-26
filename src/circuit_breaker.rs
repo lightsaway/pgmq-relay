@@ -152,7 +152,8 @@ where
             .on_call_rejected(move || {
                 rejection_metrics.record_rejection(&rejection_name);
             })
-            .build_with_handle();
+            .build_with_handle()
+            .expect("circuit breaker configuration is validated by construction");
 
         Self {
             config,
